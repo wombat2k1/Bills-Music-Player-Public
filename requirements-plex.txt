@@ -1,0 +1,6 @@
+# Optional: local playback and non-Plex features do not import this package.
+# Already present as a transitive dependency of PyChromecast (see
+# requirements-cast.txt) whenever Cast support is installed, but declared
+# explicitly here since billsmusic/plex_client.py now imports it directly
+# and must not rely on Cast providing it.
+requests==2.34.2

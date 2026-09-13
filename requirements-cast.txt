@@ -1,0 +1,3 @@
+# Optional: local playback does not import these packages.
+PyChromecast==14.0.9
+zeroconf==0.147.2

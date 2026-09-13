@@ -1,0 +1,53 @@
+﻿# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Build output
+build/
+dist/
+
+# Codex/AI temporary work directories
+.codex-*
+.codex-*/
+
+# Diagnostics and temporary files
+*.log
+*.dmp
+*.tmp
+*.bak
+incident-*
+session-*
+
+# Archives / packaged output
+*.zip
+*.7z
+
+# Compiled third-party binaries
+*.dll
+*.exe
+*.pdb
+
+# Credentials / local configuration
+.env
+.env.*
+!.env.example
+*credentials*
+*secrets*
+*.local.json
+
+# Windows
+Thumbs.db
+Desktop.ini
+
+# IDE
+.vscode/
+.idea/
