@@ -1,11 +1,11 @@
-﻿# Bills Music Player â€” package skeleton
+# Bills Music Player — package skeleton
 
 `Main.py` (3031 lines) has been split into a `billsmusic/` package. Behavior is
 unchanged; the code is just reorganized into modules.
 
 ## Layout
 
-    Main.py                  # thin launcher â€” `python Main.py` still works
+    Main.py                  # thin launcher — `python Main.py` still works
     billsmusic/
       __init__.py
       config.py              # APP_TITLE, all tuning constants, cache/config paths
@@ -43,7 +43,7 @@ unchanged; the code is just reorganized into modules.
   alongside the module-level versions in metadata.py. Collapsing them changes
   call sites, so it belongs to the refactor, not the skeleton.
 - The `except Exception` swallowing and the insecure-TLS fallback default are
-  unchanged here â€” flagged earlier, but they alter behavior so they're out of
+  unchanged here — flagged earlier, but they alter behavior so they're out of
   scope for a pure reorganization.
 
 Note: workers.py still imports nothing from window.py at runtime, but
@@ -52,18 +52,18 @@ LibraryScanThread reaches into PlayerWindow's private methods at call time
 
 ---
 
-## v2 â€” Visualizer rebuild + jukebox glow-up
+## v2 — Visualizer rebuild + jukebox glow-up
 
 ### The "doesn't feel right" fix (audio.py)
 The old analyzer re-normalised every single frame against that frame's own
-max, which auto-gained away all dynamics â€” quiet and loud passages looked
+max, which auto-gained away all dynamics — quiet and loud passages looked
 identical, and the 8 ms FFT window had no bass resolution. Rewritten to:
 
 - **Precompute the whole-track spectrogram on load** (2048-pt STFT, 512 hop,
   32 mel bands). `get_levels(t)` is now an instant array lookup, perfectly
-  aligned to the audio clock â€” no lag, no per-frame jitter.
-- **Normalise once over the whole track** using per-band percentiles (20thâ†’0,
-  97thâ†’1), so loud parts genuinely look loud. A mild gamma (1.35) makes motion
+  aligned to the audio clock — no lag, no per-frame jitter.
+- **Normalise once over the whole track** using per-band percentiles (20th→0,
+  97th→1), so loud parts genuinely look loud. A mild gamma (1.35) makes motion
   punchier.
 - Works with **soundfile**, falling back to **librosa** for formats libsndfile
   can't decode. librosa is used if present but never required.
@@ -76,7 +76,7 @@ just do cheap lookups. Poll timer dropped from 10 ms to 16 ms (~60 fps).
 ### Visualizer + GUI (widgets.py, window.py)
 - New **neon synthwave** `BeatWidget`: glowing bars with bloom, white peak
   caps, mirror reflections, an animated horizon glow that pulses with loudness,
-  and a magentaâ†’violetâ†’cyan frequency sweep. Five modes: neon, bars, waveform,
+  and a magenta→violet→cyan frequency sweep. Five modes: neon, bars, waveform,
   dots, mirror (right-click to switch, same as before).
 - Full **jukebox QSS theme**: deep-violet base, magenta/cyan gradient accents
   on buttons, sliders, progress bar, tree/queue selection, scrollbars.
@@ -84,7 +84,7 @@ just do cheap lookups. Poll timer dropped from 10 ms to 16 ms (~60 fps).
 
 All public APIs were preserved, so the rest of the app needed no further
 changes. Tested end-to-end under PyQt6: every visual mode renders, the
-analyzer tracks frequency correctly (80 Hzâ†’band 0, 1 kHzâ†’band 7, 8 kHzâ†’band 22),
+analyzer tracks frequency correctly (80 Hz→band 0, 1 kHz→band 7, 8 kHz→band 22),
 and the worker pipeline decodes-then-streams levels without blocking.
 
 ### Note on requirements
@@ -94,9 +94,9 @@ librosa is optional but improves format support (`pip install librosa`).
 
 ---
 
-## v3 â€” Visualiser diagnostic logging
+## v3 — Visualiser diagnostic logging
 
-Right-click any track in the library â†’ **"Log visualiser data"**. The track
+Right-click any track in the library → **"Log visualiser data"**. The track
 plays and every analysis frame is written to a CSV in:
 
     %LOCALAPPDATA%\Bills Music Player\vizlogs\<track>_<backend>_<timestamp>.csv
@@ -111,7 +111,7 @@ on each and compare.
   peak band / level / RMS at 7 points across the track are recorded. This lets
   the live frames be validated against what the analysis *should* produce.
 - **Per-frame rows**: `wall_s, player_clock_s, analysis_t_s, rms_db, peak_band`,
-  then `band00..band31` (the 0â€“1 levels sent to the visualiser).
+  then `band00..band31` (the 0–1 levels sent to the visualiser).
 
 Comparing `player_clock_s` vs `analysis_t_s` reveals timing offsets; comparing
 the live band columns vs the self-check reveals analysis errors. Running once
@@ -120,12 +120,12 @@ on each backend separates a sync problem from an analysis problem.
 ### Bug fixed alongside this
 `_analyzer_tick` previously only read the **VLC** clock (`active_player.get_time()`),
 so on the **built-in player** the visualiser received no time updates from the
-proper path. It's now backend-aware via a `_player_clock_s()` helper â€” which on
+proper path. It's now backend-aware via a `_player_clock_s()` helper — which on
 its own should improve how the visualiser tracks when using the built-in player.
 
 ---
 
-## v4 â€” Root cause of the "doesn't feel right" found & fixed
+## v4 — Root cause of the "doesn't feel right" found & fixed
 
 Your two diagnostic logs revealed it conclusively. The analysis numbers were
 fine; the problem was the **clock**:
@@ -133,7 +133,7 @@ fine; the problem was the **clock**:
 - The visualiser redraws at ~60 fps, but VLC's `get_time()` only reports a new
   position about **3.6 times per second**, jumping ~0.27 s each time.
 - Result: ~**16 consecutive frames showed identical data**, then snapped
-  forward â€” a stair-stepping stutter the smoothing only partly hid. Comparing
+  forward — a stair-stepping stutter the smoothing only partly hid. Comparing
   the live band columns against the self-check showed the peak band drifting
   further from expected as the song went on, the signature of clock lag.
 
@@ -145,23 +145,23 @@ vs ~7 before). When the raw clock jumps it re-anchors; it won't run more than
 one update-interval ahead, so seeks snap cleanly.
 
 This should make the bars track the music continuously instead of freezing and
-jumping. Re-run a logged track if you want to confirm â€” `player_clock_s` will
+jumping. Re-run a logged track if you want to confirm — `player_clock_s` will
 now advance every row.
 
 ### Note on the two logs
 Both logs reported `backend,vlc` despite the internal/external filenames, so
-both were VLC runs. That's fine â€” the fix targets the VLC clock, which is what
+both were VLC runs. That's fine — the fix targets the VLC clock, which is what
 you're using. The built-in player path also benefits from the same
 interpolation.
 
 ---
 
-## v5 â€” Jukebox intro animation integrated
+## v5 — Jukebox intro animation integrated
 
 The animation previewer is now wired into the app (`billsmusic/overlay.py`).
 
 ### What happens
-- **On every track change**: a full-screen intro plays â€” the artist sweeps in
+- **On every track change**: a full-screen intro plays — the artist sweeps in
   big with a clean neon glow and holds at centre, the title detonates in (one
   of four random styles each play: flyin / zoombounce / glitch / neonsweep),
   then artist + title shrink together into a glowing now-playing badge that
@@ -182,7 +182,7 @@ The animation previewer is now wired into the app (`billsmusic/overlay.py`).
 
 ### Tunables (in overlay.py, if you want to tweak the feel)
 - Intro durations per style: the dict in `start_track`.
-- `SHRINK_START` (0.80) â€” when the shrink-to-corner begins within the intro.
+- `SHRINK_START` (0.80) — when the shrink-to-corner begins within the intro.
 - Card dwell time: the `6.0` in `_tick` (seconds on screen).
 - Badge size/position: `_badge_rect`; card size/position: `_paint_card`.
 
@@ -190,7 +190,7 @@ Backup of the pre-animation version was taken before this step.
 
 ---
 
-## v6 â€” GUI cleanup: visualiser as hero, less clutter
+## v6 — GUI cleanup: visualiser as hero, less clutter
 
 Reworked the layout now that the jukebox cards carry the artist/track info:
 
@@ -210,24 +210,24 @@ Rather than delete the bio/tag/button widgets (which ~40 code paths reference),
 they're kept as hidden, still-functional objects and simply removed from the
 visible layout. This avoided breaking the bio animation subsystem, the
 scan enable/disable logic, etc. Verified: window builds, two-track cycling,
-bioâ†’cards, on-demand info panel, and resize all work.
+bio→cards, on-demand info panel, and resize all work.
 
 ### Tunables
 - Queue strip height: `setMaximumHeight(140)` in `_build_ui`.
-- Info panel size/dwell: `_paint_info_panel` (360Ã—220) and `show_info_panel`
+- Info panel size/dwell: `_paint_info_panel` (360×220) and `show_info_panel`
   `life=8.0`.
 - Card clearance from bottom: `bottom_inset` in `_paint_card`.
 
 ---
 
-## v7 â€” Badge title fit + longer card dwell
+## v7 — Badge title fit + longer card dwell
 
-- **Badge title now fits**: long titles shrink (13â†’9pt) to fit the badge width,
-  and if still too long they elide with "â€¦" before the equaliser glyph, instead
+- **Badge title now fits**: long titles shrink (13→9pt) to fit the badge width,
+  and if still too long they elide with "…" before the equaliser glyph, instead
   of spilling past the edge. Short titles still show full-size. The shrink-morph
   also lands on the fitted size so there's no overflow during the animation.
   (Tunable: the size range and reserved width in `_fit_text` / `_paint_badge`.)
-- **"DID YOU KNOW" cards stay twice as long**: dwell time 6s â†’ 12s
+- **"DID YOU KNOW" cards stay twice as long**: dwell time 6s → 12s
   (the value in `_tick`).
 
 ---
@@ -550,5 +550,6 @@ transition and zero misattributed state, false-positive watchdogs, or
 double queue advances observed. See `CODEX_HANDOFF.md`'s "v1.0.64" entries
 for the full design, the specific defects found, and the real-device
 acceptance results.
+
 
 
