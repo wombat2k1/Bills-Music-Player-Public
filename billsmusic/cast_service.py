@@ -154,6 +154,15 @@ class CastPlaybackController(QtCore.QObject):
     connected = QtCore.pyqtSignal(object)
     failed = QtCore.pyqtSignal(str)
     loaded = QtCore.pyqtSignal()
+    # The same events, each carrying the opaque `request` the caller passed
+    # to connect_device()/load_async(). The generation check below only runs
+    # on the worker thread before emitting, so a result already queued when a
+    # newer request, Stop or a return to local output happens still reaches
+    # the GUI; the request lets the receiver decide whether it still has any
+    # authority (Astra F11). Emitted alongside the untagged signals above.
+    request_connected = QtCore.pyqtSignal(object, object)  # device, request
+    request_loaded = QtCore.pyqtSignal(object)  # request
+    request_failed = QtCore.pyqtSignal(object, str)  # request, message
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -170,21 +179,22 @@ class CastPlaybackController(QtCore.QObject):
         self.connect_thread = None
         self.load_thread = None
 
-    def connect_device(self, device):
+    def connect_device(self, device, request=None):
         if self._closed:
             return
         self._generation += 1
         generation = self._generation
         self.state_changed.emit("connecting", f"Connecting to {device.name}…")
         self.connect_thread = threading.Thread(
-            target=self._connect, args=(device, generation), name="cast-connect", daemon=True,
+            target=self._connect, args=(device, generation), kwargs={"request": request},
+            name="cast-connect", daemon=True,
         )
         self.connect_thread.start()
 
     def _is_stale(self, generation) -> bool:
         return self._closed or generation != self._generation
 
-    def _connect(self, device, generation):
+    def _connect(self, device, generation, request=None):
         try:
             cast = device.cast
             if cast.socket_client.ident is not None:
@@ -211,12 +221,14 @@ class CastPlaybackController(QtCore.QObject):
                 return
             self.cast = cast
             self.connected.emit(device)
+            self.request_connected.emit(device, request)
             self.state_changed.emit("stopped", f"Casting to {device.name}")
         except Exception as exc:
             if self._is_stale(generation):
                 return
             self.cast = None
             self.failed.emit(str(exc))
+            self.request_failed.emit(request, str(exc))
             self.state_changed.emit("error", f"Could not connect: {exc}")
 
     def load(self, url, content_type, metadata, position=0.0, autoplay=True):
@@ -238,7 +250,7 @@ class CastPlaybackController(QtCore.QObject):
         )
         controller.block_until_active(timeout=10)
 
-    def load_async(self, url, content_type, metadata, position=0.0, autoplay=True):
+    def load_async(self, url, content_type, metadata, position=0.0, autoplay=True, request=None):
         if self._closed:
             return
         self._generation += 1
@@ -246,12 +258,13 @@ class CastPlaybackController(QtCore.QObject):
         self.load_thread = threading.Thread(
             target=self._load_worker,
             args=(generation, url, content_type, metadata, position, autoplay),
+            kwargs={"request": request},
             name="cast-load",
             daemon=True,
         )
         self.load_thread.start()
 
-    def _load_worker(self, generation, *args):
+    def _load_worker(self, generation, *args, request=None):
         if self._is_stale(generation):
             return
         try:
@@ -259,6 +272,7 @@ class CastPlaybackController(QtCore.QObject):
             if self._is_stale(generation):
                 return
             self.loaded.emit()
+            self.request_loaded.emit(request)
             self.state_changed.emit(
                 "playing" if args[-1] else "paused",
                 "Cast track loaded",
@@ -267,6 +281,7 @@ class CastPlaybackController(QtCore.QObject):
             if self._is_stale(generation):
                 return
             self.failed.emit(str(exc))
+            self.request_failed.emit(request, str(exc))
             self.state_changed.emit("error", f"Cast load failed: {exc}")
 
     def play(self):

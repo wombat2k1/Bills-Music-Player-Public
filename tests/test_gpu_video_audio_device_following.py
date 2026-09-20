@@ -25,11 +25,26 @@ from PyQt6 import QtCore, QtWidgets
 from PyQt6.QtMultimedia import QMediaDevices
 
 from billsmusic.video_subprocess import GpuDualDeckVideoSubprocessController
+from video_controller_teardown import release_and_collect
 
 _FIXTURE_A = os.path.join(os.path.dirname(__file__), "fixtures", "sample.mp4")
 _FIXTURE_B = os.path.join(os.path.dirname(__file__), "fixtures", "sample.mkv")
 
 _APP = None
+
+# Every real controller built in this process is released deterministically
+# in its own test's teardown -- see video_controller_teardown.py for the
+# GIL/FFmpeg-thread deadlock a garbage-collected QMediaPlayer otherwise
+# causes in whichever later test the collector happens to run in.
+_CONTROLLERS = []
+
+
+@pytest.fixture(autouse=True)
+def _release_real_controllers(monkeypatch):
+    # Depends on monkeypatch so this teardown runs before its patches
+    # (_emit, _StdinReaderThread.start) are undone.
+    yield
+    release_and_collect(_CONTROLLERS)
 
 
 def _app():
@@ -60,6 +75,7 @@ def _controller(monkeypatch):
         "billsmusic.video_subprocess._emit", lambda obj: events.append(obj),
     )
     controller = GpuDualDeckVideoSubprocessController()
+    _CONTROLLERS.append(controller)
     return controller, events
 
 

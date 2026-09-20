@@ -32,7 +32,7 @@ def _cast_play_window(**overrides):
         _cast_payload_workers=[],
         _worker_registry=WorkerLifetimeRegistry(),
         track_index_by_path={},
-        _activate_track_ui=lambda index, path: None,
+        _activate_track_ui=lambda path, *, library_index=None, queue_token=None: None,
         cast_media_server=SimpleNamespace(
             revoke_all=lambda: None,
             register_audio=lambda path: f"http://cast/{path}",

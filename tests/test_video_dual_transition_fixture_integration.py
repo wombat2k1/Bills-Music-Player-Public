@@ -45,30 +45,57 @@ def _pump_until(predicate, seconds=10.0):
 
 _FIXTURES_PRESENT = os.path.isfile(_FIXTURE_A) and os.path.isfile(_FIXTURE_B)
 
-# KNOWN BLOCKER (see CODEX_HANDOFF.md / final report): painting two
-# QVideoFrame objects sourced from two concurrently-decoding QMediaPlayer/
-# QVideoSink pipelines in one process reproducibly segfaults on this exact
-# Qt 6.11.0/PyQt6 6.11.0/FFmpeg-backend/Windows combination -- confirmed via
-# faulthandler, non-deterministic in exact trigger point, survived neither
-# QVideoFrame.paint() nor QVideoFrame.toImage()+QPainter.drawImage(). A
-# segfault kills the whole pytest process, not just this test, so this
-# module is skipped by default rather than left to crash `pytest tests/`.
-# Remove this skip once the underlying renderer issue is resolved (see the
-# investigation notes for the isolated repro scripts) -- the test itself is
-# intentionally kept as the regression check for that fix.
+# FORMER KNOWN BLOCKER, resolved 2026-09-20 (Phase 9): this module was
+# skipped because the CPU compositor segfaulted, which was read at the time
+# as "painting two concurrently-decoding QVideoFrames is unsafe on this
+# Qt/PyQt build". It was not a renderer limitation: the compositor stored
+# the QVideoFrame handed to its videoFrameChanged slot, and PyQt wraps that
+# `const QVideoFrame &` without copying, so the stored object dangled the
+# moment the slot returned and every later paintEvent read freed memory
+# (which is also why replacing paint() with toImage() in paintEvent did not
+# help -- the frame was already gone by then). The compositor now takes an
+# owned copy in the slot; see _DualDeckCompositorWidget._owned. With that,
+# the crash rate across the scenario matrix went from 4-8 in 8 runs to 0.
+#
+# The subprocess crash itself is now pinned by
+# test_video_cpu_dual_deck_stability.py, which drives the CPU child over its
+# own protocol and fails on the old code.
+#
+# This module nevertheless stays skipped, for a different and unrelated
+# reason found while trying to enable it: the CPU child predates the
+# parent's preload-identity protocol. QtVideoPlaybackBackend._accept_preload
+# _event() requires every secondary-deck event to carry preload_id,
+# source_hash and deck_index/secondary_index, which only the GPU controller
+# emits -- the CPU child still emits a bare {"event": "secondary_ready"},
+# so the parent rejects it as an unidentified preload and no transition can
+# ever complete through this API. Two further staleness: the test passes
+# dual_mode=True, but that parameter became a string ("cpu"/"gpu"/None) when
+# the GPU compositor was added, so as written it silently launched the
+# CLASSIC child, which ignores preload_secondary entirely.
+#
+# Enabling this module therefore needs the CPU controller ported onto the
+# preload-identity protocol, which is a protocol change, not the frame-
+# ownership fix Phase 9 was scoped to -- and the product never selects CPU
+# mode at all (window.py only ever calls set_dual_mode("gpu")/None). Kept,
+# unchanged apart from this note, as the end-to-end check to re-enable if
+# that port is ever done.
 pytestmark = pytest.mark.skip(
     reason=(
-        "Known blocker: concurrent dual-deck QVideoFrame painting segfaults "
-        "reproducibly in this Qt/PyQt build -- see final report. Re-enable "
-        "once the renderer issue is resolved."
+        "CPU dual-deck child predates the parent's preload-identity protocol "
+        "(no preload_id/source_hash/deck_index), so secondary events are "
+        "rejected before any transition can complete. The segfault this "
+        "module was originally skipped for is fixed and covered by "
+        "test_video_cpu_dual_deck_stability.py."
     )
 )
+
+_DUAL_MODE = "cpu"
 
 
 @pytest.mark.skipif(not _FIXTURES_PRESENT, reason="dual-deck video fixtures not present")
 def test_real_dual_mode_subprocess_completes_several_consecutive_transitions():
     _app()
-    backend = QtVideoPlaybackBackend(dual_mode=True)
+    backend = QtVideoPlaybackBackend(dual_mode=_DUAL_MODE)
     assert _pump_until(lambda: backend._process_ready, seconds=10.0), (
         "dual-mode subprocess never announced ready"
     )
@@ -109,7 +136,7 @@ def test_real_dual_mode_subprocess_completes_several_consecutive_transitions():
 @pytest.mark.skipif(not _FIXTURES_PRESENT, reason="dual-deck video fixtures not present")
 def test_cancelled_preload_leaves_no_orphaned_secondary_and_playback_continues():
     _app()
-    backend = QtVideoPlaybackBackend(dual_mode=True)
+    backend = QtVideoPlaybackBackend(dual_mode=_DUAL_MODE)
     assert _pump_until(lambda: backend._process_ready, seconds=10.0)
 
     started_events = []

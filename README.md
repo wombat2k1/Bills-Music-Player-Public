@@ -1,3 +1,34 @@
+# Bills Music Player
+
+## Public source through Phase 9
+
+This sanitised source snapshot includes the accepted Phase 9 changes:
+playback and queue identity safeguards, pause and recovery authority,
+shutdown lifetime handling, a GUI stall watchdog, and CPU dual-deck frame
+ownership fixes with regression tests. CPU dual-deck remains an experimental
+test path; the application does not select it for normal playback.
+
+BASS and FFmpeg binaries are not distributed in this repository. Obtain them
+separately under their publishers' licences; see THIRD_PARTY_DEPENDENCIES.md.
+Build scripts may consume locally supplied dependencies but those files and
+build outputs must remain untracked. Private development handoff documents,
+diagnostics, machine configuration and generated build identity are not synced.
+References to CODEX_HANDOFF.md below describe private historical development
+notes, which are intentionally not included in this public repository.
+
+Source verification:
+
+```text
+python -m compileall billsmusic tests
+python -m pytest tests
+```
+
+The tests require pytest and the application's Python dependencies. Some
+integration tests also require native media libraries or display/audio support;
+their skips and failures must be reviewed for the environment used.
+
+---
+
 # Bills Music Player — package skeleton
 
 `Main.py` (3031 lines) has been split into a `billsmusic/` package. Behavior is

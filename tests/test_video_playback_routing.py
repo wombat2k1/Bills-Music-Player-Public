@@ -79,7 +79,10 @@ def _video_window(tmp_path, cast_active=False, video_playback_enabled=True):
     window._cancel_playback_watchdog = lambda: setattr(
         calls, "cancel_watchdog", calls.cancel_watchdog + 1
     )
-    window._activate_track_ui = lambda index, path: calls.activate_ui.append((index, path))
+    window._activate_track_ui = (
+        lambda path, *, library_index=None, queue_token=None:
+        calls.activate_ui.append((library_index, path))
+    )
     window._show_video_loading_page = lambda: setattr(
         calls, "show_loading", calls.show_loading + 1
     )

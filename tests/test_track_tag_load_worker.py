@@ -87,7 +87,7 @@ def test_activate_track_ui_never_calls_mutagen_for_audio(monkeypatch):
     )
     window, displayed, async_requests = _audio_activation_window()
 
-    PlayerWindow._activate_track_ui(window, None, "Y:/network/share/song.mp3")  # must not raise
+    PlayerWindow._activate_track_ui(window, "Y:/network/share/song.mp3")  # must not raise
 
     assert async_requests == ["Y:/network/share/song.mp3"]
     assert len(displayed) == 1

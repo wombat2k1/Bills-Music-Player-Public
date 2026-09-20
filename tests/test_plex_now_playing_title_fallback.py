@@ -173,7 +173,7 @@ class ActivateTrackUiHarness:
 
 def test_activate_track_ui_shows_real_plex_title_not_ratingkey():
     harness = ActivateTrackUiHarness()
-    harness._activate_track_ui(0, PLEX_AUDIO)
+    harness._activate_track_ui(PLEX_AUDIO, library_index=0)
     assert harness.now_playing_texts[-1] == "9 PM (Till I Come)"
     assert "151212" not in harness.now_playing_texts[-1]
 
@@ -181,7 +181,7 @@ def test_activate_track_ui_shows_real_plex_title_not_ratingkey():
 def test_activate_track_ui_shows_real_plex_video_title_not_ratingkey():
     harness = ActivateTrackUiHarness()
     harness._current_media_type = MediaType.VIDEO
-    harness._activate_track_ui(0, PLEX_VIDEO)
+    harness._activate_track_ui(PLEX_VIDEO, library_index=0)
     assert harness.now_playing_texts[-1] == "Real Video Title"
     assert "107189" not in harness.now_playing_texts[-1]
 
@@ -227,7 +227,7 @@ def test_activate_track_ui_still_falls_back_to_basename_when_truly_untagged():
     # must survive for that genuinely-untagged case.
     harness = ActivateTrackUiHarness()
     local_path = "F:/music/mystery_track.flac"
-    harness._activate_track_ui(0, local_path)
+    harness._activate_track_ui(local_path, library_index=0)
     # info.title's own last-resort fallback (_load_cached_audio_tags'
     # cached(meta.get("title"), os.path.basename(path))) keeps the
     # extension -- matches test_local_path_never_consults_plex_fallback's
@@ -284,7 +284,7 @@ def test_real_sequence_plex_title_survives_subsequent_async_tag_machinery(monkey
         "title": "Take On Me", "artist": "A-Ha", "album": "Hunting High and Low",
     }
 
-    harness._activate_track_ui(0, PLEX_AUDIO)  # must not raise
+    harness._activate_track_ui(PLEX_AUDIO, library_index=0)  # must not raise
 
     assert harness.now_playing_texts[-1] == "Take On Me"
     assert harness._track_tag_load_workers == []
@@ -317,6 +317,6 @@ def test_real_sequence_local_track_title_still_gets_the_async_refresh(monkeypatc
     harness = RealAsyncActivateTrackUiHarness()
     local_path = "F:/music/Take On Me.flac"
 
-    harness._activate_track_ui(0, local_path)
+    harness._activate_track_ui(local_path, library_index=0)
 
     assert started == [local_path]

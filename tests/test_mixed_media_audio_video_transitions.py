@@ -22,12 +22,15 @@ SimpleNamespace "fake window", the same pattern test_gain_crossfade_
 identity_race.py established for v1.0.70), not isolated unit calls.
 """
 import os
+import time as _real_time_module
 from types import SimpleNamespace
+
+import pytest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import billsmusic.window as window_module
-from billsmusic.window import PlayerWindow
+from billsmusic.window import PlayerWindow, _queue_row_for_token_of
 from billsmusic.media_type import MediaType
 from billsmusic.visualiser_lifecycle import VisualiserLifecycleController, VisualiserRunState
 from billsmusic.video_dual_transition import DualDeckState
@@ -189,6 +192,33 @@ class _FakePreparedCandidate:
         return True
 
 
+class _InertGainLookupWorker:
+    """Harness replacement for workers.GainLookupWorker (a real QThread).
+
+    These fake windows bind the real _cached_gain_for_path ->
+    _queue_gain_lookup_async, so every cache miss used to start a real
+    QThread owned only by the SimpleNamespace window. Nothing here pumps the
+    Qt event loop, so its result was never delivered anyway -- but a garbage
+    collection that freed the window while the thread was still running
+    made Qt abort the whole test process. This keeps the dispatch path
+    real (subscribers, pending set, registry entry) without a thread.
+    Tests that need to deliver a result drive gain_ready themselves."""
+
+    def __init__(self, path, loudness_cache):
+        self.path = path
+        self.gain_ready = _FakeSignal()
+        self.finished = _FakeSignal()
+        self.started = False
+
+    def start(self):
+        self.started = True
+
+
+@pytest.fixture(autouse=True)
+def _no_real_gain_lookup_threads(monkeypatch):
+    monkeypatch.setattr(window_module, "GainLookupWorker", _InertGainLookupWorker)
+
+
 BOUND_METHODS = (
     "_next_mixed_transition_id", "_reset_mixed_media_transition_state",
     "_mixed_media_transition_eligible", "_begin_mixed_media_transition",
@@ -268,7 +298,7 @@ def _window(**overrides):
         _mixed_transition_direction=None,
         _mixed_transition_outgoing_path=None,
         _mixed_transition_incoming_path=None,
-        _mixed_transition_incoming_row=None,
+        _mixed_transition_incoming_token=None,
         _mixed_transition_reason=None,
         _mixed_transition_start=None,
         _mixed_transition_video_audio_scale=0.0,
@@ -297,7 +327,7 @@ def _window(**overrides):
         ),
         _audio_log=lambda message: None,
         _audio_name=lambda path: path,
-        _activate_track_ui=lambda index, path: None,
+        _activate_track_ui=lambda path, *, library_index=None, queue_token=None: None,
         _begin_playback_recovery=lambda *a, **k: None,
         _reset_progress=lambda: None,
         _arm_playback_watchdog=lambda position: None,
@@ -326,8 +356,24 @@ def _window(**overrides):
         _detach_video_from_party_mode=lambda: None,
         _resume_deferred_queue_analysis=lambda: None,
         _exit_video_fullscreen=lambda: None,
-        _next_unplayed_queue_row=lambda: next(
-            (i for i, played in enumerate(window.queue_played) if not played), None,
+        # Phase B: a row CLAIMED by an in-flight attempt is already
+        # spoken for and must be skipped, exactly as the real
+        # _next_unplayed_queue_row does -- this is what lets Manual Next
+        # move PAST a still-preparing target instead of re-selecting it,
+        # now that nothing is marked played at dispatch.
+        _next_unplayed_queue_row=lambda exclude_tokens=(): next(
+            (
+                i for i, played in enumerate(window.queue_played)
+                if not played and not (
+                    i < len(getattr(window, "_queue_entry_tokens", ()))
+                    and (
+                        window._queue_entry_tokens[i]
+                        in (getattr(window, "_queue_entry_claims", None) or {})
+                        or window._queue_entry_tokens[i] in exclude_tokens
+                    )
+                )
+            ),
+            None,
         ),
         _peek_next_media_type_for_transition=lambda: (
             None if window._next_unplayed_queue_row() is None
@@ -384,6 +430,21 @@ class _FakeClock:
         self.now += seconds
 
 
+class _MonotonicFromFakeClock:
+    """Stand-in for window.py's `time` module reference: monotonic() follows
+    a _FakeClock; everything else (time(), perf_counter(), sleep(), ...) is
+    the real module -- including _patch_clock's own time.time patch."""
+
+    def __init__(self, clock):
+        self._clock = clock
+
+    def monotonic(self):
+        return self._clock.now
+
+    def __getattr__(self, name):
+        return getattr(_real_time_module, name)
+
+
 def _patch_clock(monkeypatch, start=1_000_000.0):
     clock = _FakeClock(start)
     monkeypatch.setattr(window_module.time, "time", clock.time)
@@ -430,6 +491,14 @@ def test_audio_to_video_gap_checkpoints_carry_increasing_elapsed_ms(monkeypatch)
     next real reproduction needs to tell load/buffering/first-frame/
     visibility/fade-start/commit apart without guessing."""
     clock = _patch_clock(monkeypatch)
+    # elapsed_ms comes from time.monotonic(), not the time.time() that
+    # _patch_clock fakes. On Windows the real monotonic clock only moves in
+    # ~15.6ms ticks, so a tick landing between the visible and fade-start
+    # checkpoints (recorded in the same synchronous activation) made
+    # `visible_ms == fade_ms` fail intermittently under `pytest -n auto`
+    # load. Drive window.py's monotonic clock from the same fake clock --
+    # only for window.py's own `time` reference, not the process-wide module.
+    monkeypatch.setattr(window_module, "time", _MonotonicFromFakeClock(clock))
     window = _window()
     window._next_track("quiet-end")
     ops = _recorded_ops(window)
@@ -437,6 +506,7 @@ def test_audio_to_video_gap_checkpoints_carry_increasing_elapsed_ms(monkeypatch)
     assert "video_play_requested" in ops
     assert _recorded_details(window, "incoming_video_load_requested")["elapsed_ms"] >= 0
 
+    clock.advance(0.25)  # incoming video takes a while to report playing
     window._on_video_started()
     ops = _recorded_ops(window)
     assert "video_playing_state_received" in ops
@@ -451,6 +521,8 @@ def test_audio_to_video_gap_checkpoints_carry_increasing_elapsed_ms(monkeypatch)
     visible_ms = _recorded_details(window, "incoming_video_visible")["elapsed_ms"]
     fade_ms = _recorded_details(window, "audio_fade_out_started")["elapsed_ms"]
     assert load_ms <= playing_ms <= visible_ms == fade_ms
+    # With a deterministic clock the stages are also genuinely distinguishable.
+    assert playing_ms - load_ms == 250.0
 
     _drive_ticks(window, clock, 500)  # complete the fade
     ops = _recorded_ops(window)
@@ -537,7 +609,12 @@ def test_audio_to_video_exactly_one_queue_advance(monkeypatch):
     clock = _patch_clock(monkeypatch)
     window = _window()
     window._next_track("quiet-end")
-    assert window.queue_played == [True, True]  # marked at dispatch, matching A-A
+    # Phase B: dispatch CLAIMS the row, it does not mark it played and does
+    # not reorder the queue. The claim is what makes Manual Next skip past
+    # a still-preparing target; the commit happens when the incoming video
+    # actually becomes authoritative (or via the hard-cut fallback).
+    assert window.queue_played == [True, False]
+    assert window._queue_entry_tokens[1] in window._queue_entry_claims
     window._on_video_started()
     _drive_ticks(window, clock, 500)
     assert window.queue_played == [True, True]
@@ -580,6 +657,31 @@ def _load_video_to_audio(window, monkeypatch, near_end=True):
     worker = window._mixed_transition_load_worker
     assert worker is not None, "expected a PlayerLoadWorker to have been dispatched"
     return worker
+
+
+def test_harness_gain_lookup_dispatch_never_starts_a_real_qthread(monkeypatch):
+    """Fixture contract: a real gain-lookup dispatch from these fake windows
+    must not leave a running QThread for garbage collection to destroy
+    (which aborts the process). The dispatch bookkeeping itself stays real."""
+    import gc
+    from PyQt6 import QtCore
+    from billsmusic.workers import GainLookupWorker as RealGainLookupWorker
+
+    assert issubclass(RealGainLookupWorker, QtCore.QThread)
+    assert window_module.GainLookupWorker is _InertGainLookupWorker
+    window = _video_current_window()
+    worker = _load_video_to_audio(window, monkeypatch)
+    worker.prepared.emit(worker.token, "incoming.mp3", _FakePreparedCandidate())  # cache miss
+
+    assert "incoming.mp3" in window._gain_lookup_pending
+    assert window._gain_lookup_subscribers["incoming.mp3"] == [window._inactive_gain_token]
+    assert window._gain_lookup_workers
+    for gain_worker in window._gain_lookup_workers:
+        assert type(gain_worker) is _InertGainLookupWorker and gain_worker.started
+        assert not isinstance(gain_worker, QtCore.QThread)
+
+    del window, worker, gain_worker
+    gc.collect()  # would abort the process if a live QThread were collected here
 
 
 def test_video_to_audio_incoming_audio_loaded_before_video_end(monkeypatch):
@@ -694,15 +796,25 @@ def test_video_to_audio_preparation_slow_video_keeps_playing(monkeypatch):
 
 def test_video_preparation_failure_falls_back_without_touching_audio():
     played = []
+    fallback_tokens = []
     window = _window(
         _video_backend=_FakeVideoBackend(load_result=False),
-        _play_path_direct=lambda path, crossfade=False, index=None, immediate_crossfade=False: played.append(path) or True,
+        _play_path_direct=lambda path, crossfade=False, index=None, immediate_crossfade=False, identity_path=None, media_type_override=None, queue_entry_token=None: (
+            played.append(path), fallback_tokens.append(queue_entry_token),
+        ) and True or True,
     )
+    claimed_token = None
     window._next_track("quiet-end")
     assert window._mixed_transition_state == "idle"
     assert window.simple_player.stopped is False  # never touched
     assert played == ["incoming.mp4"]  # fell back to the direct hard-cut path
-    assert window.queue_played == [True, True]
+    # Phase B: the row is NOT marked played by the abandoned transition.
+    # The claim taken at request time is handed to the hard-cut fallback,
+    # which commits it only once that attempt becomes authoritative --
+    # here _play_path_direct is stubbed, so the commit is its job, not
+    # this transition's.
+    assert window.queue_played == [True, False]
+    assert fallback_tokens == [window._queue_entry_tokens[1]]
 
 
 def test_audio_preparation_failure_leaves_video_playing(monkeypatch):
@@ -732,7 +844,10 @@ def test_manual_next_during_audio_to_video_preparation_abandons_it():
     )
     window._next_track("quiet-end")
     assert window._mixed_transition_state == "preparing"
-    assert window.queue_played == [True, True, False]
+    # Phase B: claimed while preparing, not played -- see
+    # test_audio_to_video_exactly_one_queue_advance.
+    assert window.queue_played == [True, False, False]
+    assert window._queue_entry_tokens[1] in window._queue_entry_claims
     first_video_load = window._video_backend.load_calls[0]
 
     window.next_track()
@@ -741,7 +856,10 @@ def test_manual_next_during_audio_to_video_preparation_abandons_it():
     assert window._video_backend.stopped is True  # the abandoned video load was stopped
     # A fresh decision was made for the (now next-in-line) mixed transition.
     assert window._mixed_transition_incoming_path == "third.mp4"
-    assert window.queue_played == [True, True, True]
+    # Phase B: nothing is marked played at dispatch. The abandoned row's
+    # claim is released so it stays selectable, and the newly requested
+    # row is the one now claimed.
+    assert window.queue_played == [True, False, False]
 
 
 def test_manual_next_during_audio_to_video_active_fade_no_two_videos():
@@ -980,6 +1098,499 @@ def test_shutdown_during_active_video_to_audio_remains_clean(monkeypatch):
     assert window._mixed_transition_state == "idle"
     assert window.simple_inactive_player.stopped is True
     assert window._current_media_type == MediaType.VIDEO  # cancel doesn't touch it for V->A
+
+
+# ---------------------------------------------------------------------------
+# STOP (Astra F1): Stop must revoke mixed-transition authority
+# ---------------------------------------------------------------------------
+
+def _with_real_stop_playback(window):
+    """Wire the real PlayerWindow.stop_playback (and the real _stop_all it
+    tears physical playback down with) onto the fake window, recording
+    every later track-identity change so a stale transition that tried to
+    promote its incoming track after Stop is caught."""
+    window.active_player = None
+    window.inactive_player = None
+    window._current_playback_attempt = None
+    window.beat = SimpleNamespace(setPlaying=lambda playing: None)
+    window.btn_pause = SimpleNamespace(setText=lambda t: None, setAccessibleName=lambda t: None)
+    window._sync_now_playing_overlay_for_media_type = lambda: None
+    window.activated_after_stop = []
+    real_activate = window._activate_track_ui
+    window._activate_track_ui = lambda path, *, library_index=None, queue_token=None: (
+        window.activated_after_stop.append(path),
+        real_activate(path, library_index=library_index, queue_token=queue_token),
+    )
+    for name in ("stop_playback", "_stop_all", "_cancel_current_playback_attempt"):
+        setattr(window, name, getattr(PlayerWindow, name).__get__(window))
+    return window
+
+
+def test_stop_during_pending_video_to_audio_preparation_drops_the_late_result(monkeypatch):
+    clock = _patch_clock(monkeypatch)
+    window = _with_real_stop_playback(_video_current_window())
+    worker = _load_video_to_audio(window, monkeypatch)
+    assert window._mixed_transition_state == "preparing"
+    outgoing, incoming = window.simple_player, window.simple_inactive_player
+    generation_at_stop = window._playback_generation
+
+    window.stop_playback()
+
+    assert window._mixed_transition_state == "idle"
+    assert window.pending_next is False
+    # The held preparation result now arrives, then the fade timer keeps firing.
+    candidate = _FakePreparedCandidate("incoming.mp3")
+    worker.prepared.emit(worker.token, "incoming.mp3", candidate)
+    worker.finished.emit()
+    _drive_ticks(window, clock, 500)
+
+    assert candidate.discarded is True
+    assert incoming.commit_prepared_calls == 0
+    assert incoming.playing is False and outgoing.playing is False
+    assert window.simple_player is outgoing  # never promoted
+    assert window.activated_after_stop == []
+    assert window._playback_generation == generation_at_stop
+    assert window.queue_played == [True, False]
+    assert not getattr(window, "_queue_entry_claims", {})
+    assert window._mixed_transition_state == "idle"
+    assert window._video_backend.stopped is True
+    assert window._current_media_type == MediaType.AUDIO
+    assert window._mixed_transition_load_worker is None
+
+
+def test_stop_during_pending_audio_to_video_preparation_drops_the_late_ready(monkeypatch):
+    clock = _patch_clock(monkeypatch)
+    window = _with_real_stop_playback(_window())
+    window._next_track("quiet-end")
+    assert window._mixed_transition_state == "preparing"
+    incoming_token = window._queue_entry_tokens[1]
+    assert incoming_token in window._queue_entry_claims
+
+    window.stop_playback()
+    volume_calls_at_stop = list(window._video_backend.volume_calls)
+
+    # The incoming video's held "playing" signal arrives after Stop.
+    window._on_video_started()
+    _drive_ticks(window, clock, 500)
+
+    assert window._mixed_transition_state == "idle"
+    assert window._current_media_type == MediaType.AUDIO
+    assert window.activated_after_stop == []
+    assert window._video_backend.stopped is True
+    assert window._video_backend.volume_calls == volume_calls_at_stop
+    assert window.simple_player.playing is False
+    assert window.queue_played == [True, False]
+    # The never-started target's reservation is released with the transition,
+    # so the row stays selectable for the next explicit play command.
+    assert incoming_token not in window._queue_entry_claims
+    assert "mixed_transition_completed" not in _recorded_ops(window)
+
+
+def test_stop_during_active_video_to_audio_overlap_never_promotes(monkeypatch):
+    clock = _patch_clock(monkeypatch)
+    window = _with_real_stop_playback(_video_current_window())
+    worker = _load_video_to_audio(window, monkeypatch)
+    worker.prepared.emit(worker.token, "incoming.mp3", _FakePreparedCandidate())
+    _drive_ticks(window, clock, 3)  # both sides audible
+    assert window._mixed_transition_state == "active"
+    outgoing, incoming = window.simple_player, window.simple_inactive_player
+    assert incoming.playing is True
+    generation_at_stop = window._playback_generation
+    played_at_stop = list(window.queue_played)
+    video_volume_calls_at_stop = list(window._video_backend.volume_calls)
+    incoming_volume_calls_at_stop = list(incoming.volume_calls)
+
+    window.stop_playback()
+    _drive_ticks(window, clock, 500)  # well past where it would have completed
+    window.stop_playback()  # idempotent
+
+    assert window._mixed_transition_state == "idle"
+    assert incoming.playing is False and outgoing.playing is False
+    assert window.simple_player is outgoing and window.simple_inactive_player is incoming
+    assert window.activated_after_stop == []
+    assert window._playback_generation == generation_at_stop
+    assert window.queue_played == played_at_stop
+    assert window._video_backend.stopped is True
+    assert window._video_backend.volume_calls == video_volume_calls_at_stop
+    assert incoming.volume_calls == incoming_volume_calls_at_stop
+    assert "mixed_transition_completed" not in _recorded_ops(window)
+
+
+def test_stop_during_active_audio_to_video_overlap_never_completes(monkeypatch):
+    clock = _patch_clock(monkeypatch)
+    window = _with_real_stop_playback(_window())
+    window._next_track("quiet-end")
+    window._on_video_started()
+    _drive_ticks(window, clock, 3)
+    assert window._mixed_transition_state == "active"
+    generation_at_stop = window._playback_generation
+    played_at_stop = list(window.queue_played)
+    activated_before_stop = list(window.activated_after_stop)
+    video_volume_calls_at_stop = list(window._video_backend.volume_calls)
+
+    window.stop_playback()
+    _drive_ticks(window, clock, 500)
+
+    assert window._mixed_transition_state == "idle"
+    assert window._current_media_type == MediaType.AUDIO
+    assert window._video_backend.stopped is True
+    assert window.simple_player.playing is False
+    assert window._video_backend.volume_calls == video_volume_calls_at_stop
+    assert window.activated_after_stop == activated_before_stop
+    assert window._playback_generation == generation_at_stop
+    assert window.queue_played == played_at_stop
+    assert "mixed_transition_completed" not in _recorded_ops(window)
+
+
+def _record_video_presentation_events(window, events):
+    """Ordered record of fullscreen exit / video stop / normal-page restore,
+    mirroring test_video_fullscreen.py's
+    test_video_to_audio_transition_exits_fullscreen_before_stopping. The
+    fullscreen stub commits the exit the same way the real one does."""
+    real_stop = window._video_backend.stop
+
+    def _exit_fullscreen():
+        events.append("exit_fullscreen")
+        window._video_fullscreen = False
+
+    def _stop_video():
+        events.append("stop_video")
+        real_stop()
+
+    window._exit_video_fullscreen = _exit_fullscreen
+    window._video_backend.stop = _stop_video
+    window._show_normal_display_page = lambda: events.append("normal_page")
+
+
+def test_stop_during_active_audio_to_video_overlap_exits_fullscreen(monkeypatch):
+    """Phase 1.1: Stop now cancels the active Audio->Video transition first,
+    which flips the logical media type back to AUDIO -- so the ordinary
+    video->audio teardown in stop_playback no longer sees a video and used
+    to skip its fullscreen exit, leaving fullscreen over a stopped player."""
+    clock = _patch_clock(monkeypatch)
+    window = _with_real_stop_playback(_window())
+    window._next_track("quiet-end")
+    window._on_video_started()
+    _drive_ticks(window, clock, 3)
+    assert window._mixed_transition_state == "active"
+    window._video_fullscreen = True  # entered manually during the overlap
+    events = []
+    _record_video_presentation_events(window, events)
+
+    window.stop_playback()
+    _drive_ticks(window, clock, 500)
+
+    assert events.count("exit_fullscreen") == 1
+    assert window._video_fullscreen is False
+    # Same order as the canonical video->audio teardown: leave fullscreen
+    # before the stream is stopped and the normal page is restored.
+    assert events.index("exit_fullscreen") < events.index("stop_video") < events.index("normal_page")
+    assert window._mixed_transition_state == "idle"
+    assert window._current_media_type == MediaType.AUDIO
+    assert "mixed_transition_completed" not in _recorded_ops(window)
+
+
+def test_ordinary_video_stop_still_exits_fullscreen_exactly_once():
+    window = _with_real_stop_playback(_window(
+        current_path="clip.mp4", _current_media_type=MediaType.VIDEO,
+    ))
+    window._video_fullscreen = True
+    events = []
+    _record_video_presentation_events(window, events)
+
+    window.stop_playback()
+
+    assert events == ["exit_fullscreen", "stop_video", "normal_page"]
+    assert window._video_fullscreen is False
+    assert "mixed_transition_cancelled" not in _recorded_ops(window)
+
+
+def test_ordinary_audio_stop_leaves_fullscreen_state_untouched():
+    window = _with_real_stop_playback(_window())
+    window._video_fullscreen = False
+    events = []
+    _record_video_presentation_events(window, events)
+
+    window.stop_playback()
+
+    assert events == []
+    assert window.simple_player.playing is False
+    assert "mixed_transition_cancelled" not in _recorded_ops(window)
+
+
+# ---------------------------------------------------------------------------
+# Astra F4: a cancelled Audio->Video preparation must not leak its reservation
+# ---------------------------------------------------------------------------
+
+def _mixed_claim_owners(window):
+    return {token: owner for token, owner in window._queue_entry_claims.items()}
+
+
+def _owned_by_dead_transition(window):
+    """Claims whose owner is a mixed transition that is no longer the live one."""
+    live = None
+    if window._mixed_transition_state != "idle":
+        live = ("mixed_transition", window._mixed_transition_id)
+    return {
+        token: owner for token, owner in window._queue_entry_claims.items()
+        if isinstance(owner, tuple) and owner[0] == "mixed_transition" and owner != live
+    }
+
+
+def _with_real_attempts(window):
+    window._next_playback_attempt_id = 1
+    window._current_playback_attempt = None
+    for name in ("_begin_playback_attempt", "_advance_playback_attempt_state",
+                 "_cancel_current_playback_attempt"):
+        setattr(window, name, getattr(PlayerWindow, name).__get__(window))
+    return window
+
+
+def _video_queue_window(**overrides):
+    return _window(
+        queue=["outgoing.mp3", "v1.mp4", "v2.mp4", "v3.mp4"],
+        queue_played=[True, False, False, False],
+        queue_playlist_entries=[None, None, None, None],
+        track_index_by_path={"outgoing.mp3": 0, "v1.mp4": 1, "v2.mp4": 2, "v3.mp4": 3},
+        **overrides,
+    )
+
+
+def test_direct_selection_during_audio_to_video_preparation_releases_its_reservation(monkeypatch):
+    monkeypatch.setattr(window_module.os.path, "isfile", lambda path: True)
+    window = _with_real_attempts(_video_queue_window())
+    window._next_track("quiet-end")
+    v1_token = window._queue_entry_tokens[1]
+    assert window._queue_entry_claims[v1_token] == ("mixed_transition", window._mixed_transition_id)
+
+    # The user double-clicks a different track: the real direct-selection path.
+    window._play_path_direct("v3.mp4")
+
+    assert window._mixed_transition_incoming_path is None  # the preparation was cancelled
+    assert _owned_by_dead_transition(window) == {}
+    assert v1_token not in window._queue_entry_claims
+    assert window.queue_played[1] is False  # abandoned, not played
+
+
+def test_manual_next_during_audio_to_video_preparation_leaves_no_orphan_reservation():
+    window = _video_queue_window()
+    window._next_track("quiet-end")
+    tokens = list(window._queue_entry_tokens)
+    assert window._mixed_transition_incoming_path == "v1.mp4"
+
+    window.next_track()  # skip v1
+
+    assert window._mixed_transition_incoming_path == "v2.mp4"
+    assert _owned_by_dead_transition(window) == {}, "a cancelled transition still owns a reservation"
+    live_owner = ("mixed_transition", window._mixed_transition_id)
+    # The skipped entry stays reserved only by the live successor transition.
+    assert window._queue_entry_claims.get(tokens[1]) == live_owner
+
+    window.next_track()  # rapid Next: must not bounce back to the skipped v1
+
+    assert window._mixed_transition_incoming_path == "v3.mp4"
+    assert window._video_backend.load_calls == ["v1.mp4", "v2.mp4", "v3.mp4"]
+    assert _owned_by_dead_transition(window) == {}
+    assert window.queue_played == [True, False, False, False]
+
+
+def test_skipped_entries_become_selectable_again_once_the_successor_is_playing(monkeypatch):
+    clock = _patch_clock(monkeypatch)
+    window = _video_queue_window()
+    window._next_track("quiet-end")
+    window.next_track()  # skip v1
+    window.next_track()  # skip v2
+    tokens = list(window._queue_entry_tokens)
+
+    window._on_video_started()  # v3 becomes authoritative
+    _drive_ticks(window, clock, 500)
+
+    assert window._queue_entry_claims == {}  # nothing left reserved for skipped entries
+    played = dict(zip(window._queue_entry_tokens, window.queue_played))
+    assert played[tokens[3]] is True  # v3 committed
+    assert played[tokens[1]] is False and played[tokens[2]] is False  # skipped, still unplayed
+    next_row = window._next_unplayed_queue_row()
+    assert window._queue_entry_tokens[next_row] == tokens[1]  # and selectable again
+
+
+def test_manual_next_to_an_ordinary_track_releases_the_abandoned_reservation(monkeypatch):
+    monkeypatch.setattr(window_module.os.path, "isfile", lambda path: False)
+    window = _with_real_attempts(_window(
+        queue=["outgoing.mp3", "v1.mp4", "next.mp3"],
+        queue_played=[True, False, False],
+        queue_playlist_entries=[None, None, None],
+        track_index_by_path={"outgoing.mp3": 0, "v1.mp4": 1, "next.mp3": 2},
+    ))
+    window._next_track("quiet-end")
+    v1_token = window._queue_entry_tokens[1]
+
+    window.next_track()  # successor is an ordinary playback attempt, not a transition
+
+    assert window._mixed_transition_state == "idle"
+    assert _owned_by_dead_transition(window) == {}
+    assert v1_token not in window._queue_entry_claims
+    assert window.queue_played == [True, False, False]
+
+
+def test_stop_after_a_manual_next_chain_releases_every_skipped_reservation():
+    """Phase 1 Stop contract, extended to reservations a live transition
+    holds for entries it skipped past."""
+    window = _with_real_stop_playback(_video_queue_window())
+    window._next_track("quiet-end")
+    window.next_track()
+
+    window.stop_playback()
+
+    assert window._mixed_transition_state == "idle"
+    assert window._queue_entry_claims == {}
+    assert window.queue_played == [True, False, False, False]
+    assert window._next_unplayed_queue_row() == 1  # stopped media stays selectable
+
+
+# ---------------------------------------------------------------------------
+# Astra F5: a rejected (removed/replaced) target must not play via fallback
+# ---------------------------------------------------------------------------
+
+class _FakeQueueList:
+    def __init__(self, current_row=0):
+        self._current_row = current_row
+
+    def currentRow(self):
+        return self._current_row
+
+    def setCurrentRow(self, row):
+        self._current_row = row
+
+    def selectedItems(self):
+        return []
+
+    def row(self, item):
+        return 0
+
+    def verticalScrollBar(self):
+        return None
+
+
+def _with_real_queue_editing(window, current_row):
+    window.queue_list = _FakeQueueList(current_row)
+    window._ensure_queue_played_flags = PlayerWindow._ensure_queue_played_flags.__get__(window)
+    window._queue_undo_snapshot = None
+    window._update_undo_action_state = lambda: None
+    window._remove_queue_row_widget = lambda row, reason=None: None
+    window._schedule_session_save = lambda: None
+    window._queue_mutation_epoch = 0
+    return window
+
+
+def _recording_fallback_window(**overrides):
+    played = []
+    activated = []
+    window = _window(
+        queue=["outgoing.mp3", "incoming.mp4", "third.mp3"],
+        queue_played=[True, False, False],
+        queue_playlist_entries=[None, None, None],
+        track_index_by_path={"outgoing.mp3": 0, "incoming.mp4": 1, "third.mp3": 2},
+        _play_path_direct=lambda path, **kw: played.append((path, kw.get("queue_entry_token"))) or True,
+        _activate_track_ui=lambda path, *, library_index=None, queue_token=None: activated.append(path),
+        **overrides,
+    )
+    window.fallback_played, window.activated_paths = played, activated
+    return window
+
+
+def _assert_rejected_target_terminated(window, incoming_token):
+    assert window.fallback_played == [], f"rejected target replayed via fallback: {window.fallback_played}"
+    assert "incoming.mp4" not in window.activated_paths
+    assert window._current_media_type == MediaType.AUDIO
+    assert window._mixed_transition_state == "idle"
+    assert window._video_backend.stopped is True
+    assert incoming_token not in window._queue_entry_claims
+    assert all(
+        not (isinstance(owner, tuple) and owner[0] == "mixed_transition")
+        for owner in window._queue_entry_claims.values()
+    )
+    assert "mixed_transition_started" not in _recorded_ops(window)
+
+
+def test_removed_video_target_is_not_replayed_through_fallback():
+    window = _with_real_queue_editing(_recording_fallback_window(), current_row=1)
+    window._next_track("quiet-end")
+    incoming_token = window._queue_entry_tokens[1]
+
+    PlayerWindow._remove_selected_queue_item(window)  # the user removes "incoming.mp4"
+    assert "incoming.mp4" not in window.queue
+    window._on_video_started()  # its readiness arrives afterwards
+
+    _assert_rejected_target_terminated(window, incoming_token)
+    assert window.queue_played == [True, False]  # nothing committed
+
+
+def test_cleared_queue_target_is_not_replayed_through_fallback():
+    window = _with_real_queue_editing(_recording_fallback_window(), current_row=1)
+    window._refresh_queue_list = lambda **kw: None
+    window._next_track("quiet-end")
+    incoming_token = window._queue_entry_tokens[1]
+
+    PlayerWindow._clear_up_next_queue(window)
+    window._on_video_started()
+
+    _assert_rejected_target_terminated(window, incoming_token)
+    assert window.queue == [] and window.queue_played == []
+
+
+def test_replaced_source_under_the_same_token_is_not_replayed_through_fallback():
+    window = _recording_fallback_window()
+    window._next_track("quiet-end")
+    incoming_token = window._queue_entry_tokens[1]
+
+    window.queue[1] = "replacement.mp4"  # missing-track repair: same token, new source
+    window._on_video_started()  # readiness for the OLD prepared source
+
+    _assert_rejected_target_terminated(window, incoming_token)
+    assert window.queue_played == [True, False, False]
+    # The replacement stays in the queue, unplayed and selectable.
+    assert window._queue_entry_tokens[1] == incoming_token
+    assert window._next_unplayed_queue_row() == 1
+
+
+def test_preparation_failure_after_target_removal_is_not_replayed_through_fallback():
+    window = _with_real_queue_editing(_recording_fallback_window(), current_row=1)
+    window._next_track("quiet-end")
+    incoming_token = window._queue_entry_tokens[1]
+
+    PlayerWindow._remove_selected_queue_item(window)
+    window._on_video_error("video_decode_error", "decoder failed")  # a "recoverable" failure
+
+    _assert_rejected_target_terminated(window, incoming_token)
+
+
+def test_replaced_audio_target_of_video_to_audio_is_rejected_and_its_prepared_audio_stopped(monkeypatch):
+    window = _video_current_window()
+    worker = _load_video_to_audio(window, monkeypatch)
+    incoming = window.simple_inactive_player
+    incoming_token = window._queue_entry_tokens[1]
+
+    window.queue[1] = "replacement.mp3"  # same token, new source, while preparing
+    worker.prepared.emit(worker.token, "incoming.mp3", _FakePreparedCandidate("incoming.mp3"))
+
+    assert window._mixed_transition_state == "idle"
+    assert incoming.playing is False  # the silently started candidate was stopped
+    assert window.queue_played == [True, False]  # nothing committed
+    assert incoming_token not in window._queue_entry_claims
+    assert window._video_backend.stopped is False  # the current video keeps playing
+    assert window._current_media_type == MediaType.VIDEO
+
+
+def test_genuine_video_preparation_failure_with_a_valid_target_still_falls_back():
+    """Guard: F5 must not be fixed by disabling the legitimate fallback."""
+    window = _recording_fallback_window()
+    window._next_track("quiet-end")
+    incoming_token = window._queue_entry_tokens[1]
+
+    window._on_video_error("video_decode_error", "decoder failed")
+
+    assert window.fallback_played == [("incoming.mp4", incoming_token)]
+    assert window._mixed_transition_state == "idle"
 
 
 def test_replaygain_identity_still_correct_during_video_to_audio_incoming_fade(monkeypatch):
@@ -1433,7 +2044,7 @@ def test_manual_queue_identity_preserved_across_full_mixed_six_track_queue(monke
     assert expected_row == 1 and queue[expected_row] == "B.mp4"
     window._next_track("quiet-end")
     assert window._mixed_transition_direction == "audio_to_video"
-    assert window._mixed_transition_incoming_row == expected_row
+    assert _queue_row_for_token_of(window, window._mixed_transition_incoming_token) == expected_row
     assert window._mixed_transition_incoming_path == queue[expected_row]
     window._on_video_started()
     _drive_ticks(window, clock, 500)
@@ -1449,7 +2060,7 @@ def test_manual_queue_identity_preserved_across_full_mixed_six_track_queue(monke
     window._tick()
     worker = window._mixed_transition_load_worker
     assert worker is not None
-    assert window._mixed_transition_incoming_row == expected_row
+    assert _queue_row_for_token_of(window, window._mixed_transition_incoming_token) == expected_row
     assert window._mixed_transition_incoming_path == queue[expected_row]
     worker.prepared.emit(worker.token, queue[expected_row], _FakePreparedCandidate())
     _drive_ticks(window, clock, 500)
@@ -1464,7 +2075,7 @@ def test_manual_queue_identity_preserved_across_full_mixed_six_track_queue(monke
     assert expected_row == 3 and queue[expected_row] == "D.mp4"
     window.next_track()
     assert window._mixed_transition_direction == "audio_to_video"
-    assert window._mixed_transition_incoming_row == expected_row
+    assert _queue_row_for_token_of(window, window._mixed_transition_incoming_token) == expected_row
     assert window._mixed_transition_incoming_path == queue[expected_row]
     window._on_video_started()
     _drive_ticks(window, clock, 500)
@@ -1492,7 +2103,7 @@ def test_manual_queue_identity_preserved_across_full_mixed_six_track_queue(monke
     window._tick()
     worker = window._mixed_transition_load_worker
     assert worker is not None
-    assert window._mixed_transition_incoming_row == expected_row
+    assert _queue_row_for_token_of(window, window._mixed_transition_incoming_token) == expected_row
     assert window._mixed_transition_incoming_path == queue[expected_row]
     worker.prepared.emit(worker.token, queue[expected_row], _FakePreparedCandidate())
     _drive_ticks(window, clock, 500)

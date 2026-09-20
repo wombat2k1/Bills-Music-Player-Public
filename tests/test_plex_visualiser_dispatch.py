@@ -460,7 +460,7 @@ def test_plex_to_local_to_plex_no_stale_analyzer_or_waveform_source_leaks():
     harness = PlexLocalPlexHarness()
 
     # -- 1. Plex becomes current --
-    harness._activate_track_ui(None, PLEX_AUDIO)
+    harness._activate_track_ui(PLEX_AUDIO)
     harness.analyzer.load.assert_not_called()
     harness.analyzer_worker.update_track.emit.assert_not_called()
     harness.waveform_worker.request.assert_not_called()
@@ -475,7 +475,7 @@ def test_plex_to_local_to_plex_no_stale_analyzer_or_waveform_source_leaks():
 
     # -- 2. switch to Local -- existing waveform/analyzer preparation must
     # resume completely unchanged, with no leftover Plex-only state.
-    harness._activate_track_ui(None, LOCAL_AUDIO)
+    harness._activate_track_ui(LOCAL_AUDIO)
     harness.analyzer.load.assert_called_once_with(LOCAL_AUDIO)
     harness.analyzer_worker.update_track.emit.assert_called_once_with(LOCAL_AUDIO)
     harness.waveform_worker.request.assert_called_once_with(LOCAL_AUDIO)
@@ -488,7 +488,7 @@ def test_plex_to_local_to_plex_no_stale_analyzer_or_waveform_source_leaks():
 
     # -- 3. back to Plex -- must behave exactly like step 1 again, not
     # skip anything because it already ran once this session.
-    harness._activate_track_ui(None, PLEX_AUDIO)
+    harness._activate_track_ui(PLEX_AUDIO)
     assert harness.waveform_seekbar.set_waveform.call_count == 2  # unavailable again, immediately
     assert harness.analyzer.load.call_count == 1  # not called again
     assert harness.analyzer_worker.update_track.emit.call_count == 1  # not called again

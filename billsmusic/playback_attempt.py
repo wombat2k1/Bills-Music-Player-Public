@@ -46,6 +46,15 @@ class PlaybackAttempt:
     reason: str
     queue_entry_id: Optional[object] = None
     state: PlaybackAttemptState = field(default=PlaybackAttemptState.REQUESTED)
+    # Why a dispatch that never started playback failed, set as it becomes
+    # terminal (e.g. "source_unavailable" for a missing local file), so the
+    # advancement policy can tell an unavailable entry from a backend failure.
+    terminal_reason: Optional[str] = None
+    # The automatic advancement reason ("near-end", "video-ended", ...) when
+    # this attempt was dispatched by automatic advancement rather than an
+    # explicit request. It stays with the attempt through asynchronous
+    # preparation, so a result arriving while paused is held (Astra F2).
+    automatic_reason: Optional[str] = None
 
     def is_terminal(self) -> bool:
         return self.state in TERMINAL_STATES

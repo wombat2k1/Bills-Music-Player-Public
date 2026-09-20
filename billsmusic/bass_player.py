@@ -11,6 +11,7 @@ import math
 import os
 import platform
 import threading
+import time
 from typing import Optional
 
 
@@ -175,6 +176,8 @@ class _BassEngine:
         bass.BASS_ChannelSetAttribute.restype = ctypes.c_bool
         bass.BASS_ChannelSlideAttribute.argtypes = [ctypes.c_uint, ctypes.c_uint, ctypes.c_float, ctypes.c_uint]
         bass.BASS_ChannelSlideAttribute.restype = ctypes.c_bool
+        bass.BASS_ChannelGetAttribute.argtypes = [ctypes.c_uint, ctypes.c_uint, ctypes.POINTER(ctypes.c_float)]
+        bass.BASS_ChannelGetAttribute.restype = ctypes.c_bool
         bass.BASS_ChannelGetLength.argtypes = [ctypes.c_uint, ctypes.c_uint]
         bass.BASS_ChannelGetLength.restype = ctypes.c_ulonglong
         bass.BASS_ChannelGetPosition.argtypes = [ctypes.c_uint, ctypes.c_uint]
@@ -352,6 +355,16 @@ class BassPlayer:
         self._length = 0.0
         self._volume = 1.0
         self._paused = False
+        # Astra F2 (Phase 4.2): BASS processes attribute slides in real time
+        # whether the channel is playing or paused, so a crossfade's volume
+        # slide would otherwise complete during a Pause. _slide is the slide
+        # in progress, (target volume, monotonic deadline); pause() freezes
+        # it at the level it has reached and keeps the rest in _held_slide,
+        # (target volume, remaining seconds), for resume() to continue.
+        # set_volume() (which stops a BASS slide), stop() and every new
+        # stream discard both.
+        self._slide = None
+        self._held_slide = None
         # Stage 3A: kept alive for the full lifetime of a URL-backed
         # stream. Verified empirically that BASS still played correctly
         # after this exact buffer was dereferenced+GC'd in a standalone
@@ -507,9 +520,35 @@ class BassPlayer:
         if self._stream:
             _BassEngine.ensure().BASS_ChannelPause(self._stream)
             self._paused = True
+            self._hold_volume_slide()
 
     def resume(self):
+        held, self._held_slide = self._held_slide, None
+        if held is not None and self._stream:
+            target, remaining = held
+            try:
+                self.slide_volume(target, remaining)
+            except BassLoadError:
+                self.set_volume(target)
         self.play()
+
+    def _hold_volume_slide(self) -> None:
+        """Freeze a volume slide still in progress at the level it has
+        reached, keeping its target and remaining time for resume()."""
+        slide, self._slide = self._slide, None
+        if slide is None or not self._stream:
+            return
+        target, deadline = slide
+        remaining = deadline - time.monotonic()
+        if remaining <= 0.0:
+            return
+        bass = _BassEngine.ensure()
+        level = ctypes.c_float()
+        if not bass.BASS_ChannelGetAttribute(self._stream, BASS_ATTRIB_VOL, ctypes.byref(level)):
+            return
+        # Setting the attribute stops the slide where it is.
+        bass.BASS_ChannelSetAttribute(self._stream, BASS_ATTRIB_VOL, level)
+        self._held_slide = (target, remaining)
 
     def stop(self):
         if self._stream:
@@ -521,6 +560,8 @@ class BassPlayer:
                 self._stream = 0
                 self._url_buffer = None
         self._paused = False
+        self._slide = None
+        self._held_slide = None
 
     def close(self):
         self.stop()
@@ -536,6 +577,9 @@ class BassPlayer:
 
     def set_volume(self, value: float):
         self._volume = max(0.0, min(1.0, float(value)))
+        # An explicit level replaces any slide, running or held by pause().
+        self._slide = None
+        self._held_slide = None
         if self._stream:
             _BassEngine.ensure().BASS_ChannelSetAttribute(
                 self._stream, BASS_ATTRIB_VOL, ctypes.c_float(self._volume)
@@ -551,6 +595,8 @@ class BassPlayer:
             )
             if not ok:
                 raise BassLoadError(f"BASS_ChannelSlideAttribute failed: {_BassEngine.error_code()}")
+            self._slide = (self._volume, time.monotonic() + millis / 1000.0)
+            self._held_slide = None
             return True
         return False
 

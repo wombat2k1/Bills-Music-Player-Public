@@ -29,6 +29,8 @@ import json
 import os
 import time
 
+import pytest
+
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PyQt6 import QtCore, QtWidgets
@@ -135,11 +137,17 @@ def _open_preferences_and_run(window, mutate):
         QtCore.QTimer.singleShot(20, _apply)
         return orig_exec(self)
 
-    QDialog.exec = _fake_exec
-    try:
+    # Scoped via MonkeyPatch rather than `QDialog.exec = orig_exec` in a
+    # finally: reading QDialog.exec off the class yields a plain builtin
+    # function, not sip's binding method descriptor, so writing that back
+    # permanently broke `dialog.exec()` for every later test in the same
+    # process ("exec(self): first argument of unbound method must have type
+    # 'QDialog'" -- e.g. all of test_queue_dedup_dialogs_qtest.py whenever it
+    # shared an xdist worker with this file). MonkeyPatch restores the
+    # original class __dict__ entry itself.
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(QDialog, "exec", _fake_exec)
         window._show_normalisation_preferences()
-    finally:
-        QDialog.exec = orig_exec
     _pump(0.1)
 
 
@@ -147,6 +155,28 @@ def _find(dialog, object_name):
     widget = dialog.findChild(QtWidgets.QWidget, object_name)
     assert widget is not None, f"widget {object_name!r} not found in Preferences dialog"
     return widget
+
+
+def test_open_preferences_helper_leaves_real_dialog_exec_working_afterwards():
+    """Regression: this helper's own QDialog.exec patch used to be undone
+    with `QDialog.exec = orig_exec`, which silently broke dialog.exec() for
+    the rest of the process. Uses a stand-in window whose preferences
+    method just runs a plain QDialog, so no real PlayerWindow is needed."""
+    from PyQt6.QtWidgets import QDialog
+
+    _app()
+    mutated = []
+
+    class _Window:
+        def _show_normalisation_preferences(self):
+            return QDialog().exec()
+
+    _open_preferences_and_run(_Window(), mutated.append)
+    assert len(mutated) == 1
+
+    later_dialog = QDialog()
+    QtCore.QTimer.singleShot(20, later_dialog.accept)
+    assert later_dialog.exec() == QDialog.DialogCode.Accepted
 
 
 # -- Static checks: the wiring survives even where live widgets aren't ------

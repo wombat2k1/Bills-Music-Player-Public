@@ -115,7 +115,7 @@ def test_load_lrc_for_track_cache_miss_dispatch_does_not_block(blocked_io, monke
 
     monkeypatch.setattr(window_module, "LyricsLoadWorker", _FakeWorker)
     generation = window_module.NowPlayingGeneration()
-    generation.begin("song.mp3", None)
+    generation.begin("song.mp3")
     window = SimpleNamespace(
         _closing=False,
         _now_playing_generation=generation,
@@ -251,7 +251,7 @@ def test_cast_play_path_dispatch_does_not_block(blocked_io, monkeypatch):
         _cast_payload_cache={}, _cast_artwork_paths={}, _cast_payload_generation=0, _cast_payload_workers=[],
         _worker_registry=WorkerLifetimeRegistry(),
         track_index_by_path={},
-        _activate_track_ui=lambda index, path: None,
+        _activate_track_ui=lambda path, *, library_index=None, queue_token=None: None,
         cast_media_server=SimpleNamespace(
             revoke_all=lambda: None, register_audio=lambda path: f"http://cast/{path}",
             register=lambda path, content_type=None: f"http://cast/art/{path}",

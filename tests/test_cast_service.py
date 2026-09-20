@@ -467,6 +467,31 @@ def test_load_worker_proceeds_normally_for_the_current_generation():
     assert cast.media_controller.calls[0][0] == "load"
 
 
+def test_load_worker_tags_its_results_with_the_originating_request():
+    """Astra F11: the request passed to load_async()/connect_device() comes
+    back on the request_* signals, so the GUI can tell whose result it is."""
+    cast = FakeCast()
+    controller = CastPlaybackController()
+    controller.cast = cast
+    loaded, failed, connected = [], [], []
+    controller.request_loaded.connect(loaded.append)
+    controller.request_failed.connect(lambda request, message: failed.append((request, message)))
+    controller.request_connected.connect(lambda device, request: connected.append((device.uuid, request)))
+    request = object()
+    controller._generation = 1
+
+    controller._load_worker(1, "http://host/token", "audio/mpeg", {}, 0.0, True, request=request)
+    controller.cast = None  # the next load fails: no device connected
+    controller._load_worker(1, "http://host/token", "audio/mpeg", {}, 0.0, True, request=request)
+    controller.connect_device(CastDevice("dev-1", "Living Room", FakeCast()), request=request)
+    controller.connect_thread.join(timeout=5)
+
+    assert loaded == [request]
+    assert failed == [(request, "No Cast device connected")]
+    assert _spin_until(lambda: connected)
+    assert connected == [("dev-1", request)]
+
+
 def test_discovery_refresh_drops_result_after_close():
     release = threading.Event()
     browser = FakeBrowser()

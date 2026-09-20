@@ -51,7 +51,7 @@ def test_lyrics_dispatch_stays_responsive_under_simulated_nas_latency(monkeypatc
 
     monkeypatch.setattr(workers_module, "load_lyrics_for_track", _slow_load)
     generation = window_module.NowPlayingGeneration()
-    generation.begin("song.mp3", None)
+    generation.begin("song.mp3")
     window = SimpleNamespace(
         _closing=False,
         _now_playing_generation=generation,

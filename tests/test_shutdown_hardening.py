@@ -262,7 +262,7 @@ def test_load_lrc_for_track_registers_and_unregisters_normally(monkeypatch):
     monkeypatch.setattr(window_module, "LyricsLoadWorker", _FakeWorker)
     registry = WorkerLifetimeRegistry()
     generation = window_module.NowPlayingGeneration()
-    generation.begin("a.mp3", None)
+    generation.begin("a.mp3")
     window = SimpleNamespace(
         _closing=False,
         _now_playing_generation=generation,
@@ -1275,8 +1275,11 @@ def test_close_event_with_a_pending_worker_ignores_the_close_and_keeps_the_windo
         _save_session=lambda: None,
         _save_queue_analysis_cache=lambda: None,
         hide=lambda: hide_calls.append(True),
+        _shutdown_grace_timer=None,
     )
     window._request_shutdown = lambda: PlayerWindow._request_shutdown(window)
+    window._arm_shutdown_grace_timer = lambda: setattr(window, "_shutdown_grace_timer", object())
+    window._cancel_shutdown_grace_timer = lambda: setattr(window, "_shutdown_grace_timer", None)
     event = SimpleNamespace(ignore=lambda: None, accept=lambda: accept_calls.append(True))
 
     PlayerWindow.closeEvent(window, event)
@@ -1287,6 +1290,9 @@ def test_close_event_with_a_pending_worker_ignores_the_close_and_keeps_the_windo
     assert accept_calls == []  # never accepted -- window stays alive
     assert finalize_calls == []  # _finalize_shutdown never reached
     assert window._shutdown_complete is False
+    # Stage 2 armed the single forced-exit safety net rather than leaving
+    # the hidden window waiting on a worker that may never finish.
+    assert window._shutdown_grace_timer is not None
 
 
 def test_final_worker_finish_resumes_and_completes_shutdown():
@@ -1297,15 +1303,19 @@ def test_final_worker_finish_resumes_and_completes_shutdown():
     registry = WorkerLifetimeRegistry()
     token = registry.register("plex_audio_load", thread=SimpleNamespace(wait=lambda ms: True))
     close_calls = []
+    cancel_calls = []
     window = SimpleNamespace(
         _shutdown_pending=True, _worker_registry=registry,
         close=lambda: close_calls.append(True),
+        _cancel_shutdown_grace_timer=lambda: cancel_calls.append(True),
     )
 
     registry.unregister(token)
     PlayerWindow._maybe_resume_final_shutdown(window)
 
     assert close_calls == [True]
+    # The forced-exit path must be disarmed on the normal route out.
+    assert cancel_calls == [True]
 
 
 def test_multiple_pending_workers_only_the_last_to_finish_resumes_shutdown():
@@ -1316,6 +1326,7 @@ def test_multiple_pending_workers_only_the_last_to_finish_resumes_shutdown():
     window = SimpleNamespace(
         _shutdown_pending=True, _worker_registry=registry,
         close=lambda: close_calls.append(True),
+        _cancel_shutdown_grace_timer=lambda: None,
     )
 
     registry.unregister(token_a)
@@ -1336,6 +1347,176 @@ def test_maybe_resume_final_shutdown_is_a_noop_during_normal_non_shutdown_operat
     )
     PlayerWindow._maybe_resume_final_shutdown(window)
     assert close_calls == []
+
+
+# ---------------------------------------------------------------------------
+# Phase C2 Stage 2: the grace timer / forced-exit safety net.
+#
+# Before this, a worker the registry could never prove finished (stuck in a
+# native call -- a libsndfile read against a dead NAS mount, a hung socket in
+# album_art_fetch) left closeEvent permanently in its event.ignore() branch:
+# the window hidden, _finalize_shutdown() never reached, the process alive
+# and invisible with BASS/miniaudio/video backends still open, killable only
+# from Task Manager. _maybe_resume_final_shutdown() was the ONLY route out
+# and it is only ever called from a worker's finished handler.
+# ---------------------------------------------------------------------------
+
+def _close_event_window(registry, arm_calls):
+    """Fake carrying what PlayerWindow.closeEvent touches, with the grace
+    timer's Qt construction replaced by a counter so arming is observable
+    without a QApplication."""
+    window = SimpleNamespace(
+        _closing=False, _shutdown_requested=False, _shutdown_pending=False,
+        _shutdown_complete=False, _shutdown_finalizing=False,
+        _shutdown_grace_timer=None,
+        _video_fullscreen=False, mini_player=None, party_mode=None,
+        recently_played_repository=SimpleNamespace(save=lambda entries: None),
+        recently_played_entries=[],
+        _playback_generation=0, _plex_audio_load_token=0, _crossfade_load_token=0,
+        _karaoke_generation=0, _library_search_generation=0,
+        _playback_recovery_active=False,
+        _worker_registry=registry,
+        diagnostics=SimpleNamespace(record=lambda *a, **kw: None, shutdown=lambda: None),
+        _cancel_current_playback_attempt=lambda reason: None,
+        _cancel_playback_watchdog=lambda: None,
+        _audio_log=lambda message: None,
+        _cancel_pending_library_apply=lambda: None,
+        _cancel_fade=lambda: None,
+        _stop_all=lambda: None,
+        _cancel_metadata_backfill=lambda: None,
+        _mixed_transition_state="idle",
+        _video_backend=None,
+        _save_session=lambda: None,
+        _save_queue_analysis_cache=lambda: None,
+        hide=lambda: None,
+        accepted=[],
+    )
+    window._request_shutdown = lambda: PlayerWindow._request_shutdown(window)
+    window._finalize_shutdown = lambda: None
+
+    def _arm():
+        arm_calls.append(True)
+        window._shutdown_grace_timer = object()
+
+    window._arm_shutdown_grace_timer = _arm
+    window._cancel_shutdown_grace_timer = lambda: setattr(window, "_shutdown_grace_timer", None)
+    return window
+
+
+def _grace_window(registry, *, shutdown_complete=False):
+    """Minimal fake carrying only what the Stage 2 paths touch."""
+    recorded = []
+    window = SimpleNamespace(
+        _shutdown_complete=shutdown_complete,
+        _shutdown_grace_timer=None,
+        _worker_registry=registry,
+        diagnostics=SimpleNamespace(
+            record=lambda category, operation, **kw: recorded.append((category, operation, kw)),
+            shutdown=lambda: recorded.append(("diagnostics", "shutdown", {})),
+        ),
+        _audio_log=lambda message: None,
+        forced=[],
+        finalized=[],
+        closed=[],
+    )
+    window._force_process_exit = lambda code: window.forced.append(code)
+    window._finalize_shutdown = lambda: window.finalized.append(True)
+    window.close = lambda: window.closed.append(True)
+    window.recorded = recorded
+    return window
+
+
+def test_close_event_starts_one_grace_timer_when_worker_never_finishes(monkeypatch):
+    monkeypatch.setattr(QtWidgets.QApplication, "instance", staticmethod(lambda: None))
+    registry = WorkerLifetimeRegistry()
+    # wait() always False: the registry can never prove this one finished,
+    # and its finished signal will never arrive either.
+    registry.register("album_art_fetch", thread=SimpleNamespace(wait=lambda ms: False), wait_ms=1)
+    arm_calls = []
+    window = _close_event_window(registry, arm_calls)
+    event = SimpleNamespace(ignore=lambda: None, accept=lambda: window.accepted.append(True))
+
+    PlayerWindow.closeEvent(window, event)
+
+    assert window._shutdown_pending is True
+    assert window.accepted == []
+    assert arm_calls == [True]  # exactly one grace timer armed
+
+
+def test_repeated_close_does_not_arm_multiple_grace_timers(monkeypatch):
+    monkeypatch.setattr(QtWidgets.QApplication, "instance", staticmethod(lambda: None))
+    registry = WorkerLifetimeRegistry()
+    registry.register("plex_audio_load", thread=SimpleNamespace(wait=lambda ms: False), wait_ms=1)
+    arm_calls = []
+    window = _close_event_window(registry, arm_calls)
+    event = SimpleNamespace(ignore=lambda: None, accept=lambda: window.accepted.append(True))
+
+    PlayerWindow.closeEvent(window, event)
+    PlayerWindow.closeEvent(window, event)
+    PlayerWindow.closeEvent(window, event)
+
+    # Re-arming on every close would let a user postpone the forced exit
+    # indefinitely by clicking X repeatedly.
+    assert arm_calls == [True]
+    assert window.accepted == []
+
+
+def test_worker_finishing_during_grace_period_uses_normal_shutdown_not_force_exit():
+    registry = WorkerLifetimeRegistry()
+    token = registry.register("bio", thread=SimpleNamespace(wait=lambda ms: False))
+    cancel_calls = []
+    close_calls = []
+    window = SimpleNamespace(
+        _shutdown_pending=True,
+        _worker_registry=registry,
+        close=lambda: close_calls.append(True),
+        _cancel_shutdown_grace_timer=lambda: cancel_calls.append(True),
+    )
+
+    # The worker resolves normally, inside the grace window.
+    registry.unregister(token)
+    PlayerWindow._maybe_resume_final_shutdown(window)
+
+    assert close_calls == [True]      # normal close re-entered
+    assert cancel_calls == [True]     # forced-exit path disarmed first
+
+
+def test_grace_expiry_rechecks_registry_before_force_exit():
+    # The timer may fire after the last worker resolved but before its
+    # queued finished handler ran -- the re-check must find an empty
+    # registry and take the normal, fully safe teardown.
+    registry = WorkerLifetimeRegistry()
+    window = _grace_window(registry)
+
+    PlayerWindow._on_shutdown_grace_expired(window)
+
+    assert window.forced == []          # never forced
+    assert window.finalized == [True]   # normal native teardown ran
+    assert window.closed == [True]
+
+
+def test_grace_expiry_with_stuck_worker_records_diagnostic_and_requests_force_exit():
+    registry = WorkerLifetimeRegistry()
+    token = registry.register("album_art_fetch", thread=SimpleNamespace(wait=lambda ms: False))
+    window = _grace_window(registry)
+
+    PlayerWindow._on_shutdown_grace_expired(window)
+
+    assert window.forced == [0]        # forced exit requested
+    # _finalize_shutdown must NOT run: everything it closes (BASS streams,
+    # the video backend, the Cast media server) may still be in use by the
+    # worker that could not be proven finished.
+    assert window.finalized == []
+    forced_events = [
+        kw for category, operation, kw in window.recorded
+        if operation == "shutdown_forced_exit"
+    ]
+    assert len(forced_events) == 1
+    details = forced_events[0]["details"]
+    assert details["unproven_count"] == 1
+    assert details["unproven_workers"] == [
+        {"worker_id": token, "category": "album_art_fetch"}
+    ]
 
 
 def test_no_migrated_registry_worker_has_a_second_competing_cancel_path():

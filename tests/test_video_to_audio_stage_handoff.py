@@ -180,7 +180,10 @@ def _stage(monkeypatch, *, party_mode=None):
     h._dual_transition_committed_state_value = lambda: None
     h._resume_deferred_queue_analysis = lambda: None
     h._mixed_transition_owns_video_boundary = lambda: False
-    h._activate_track_ui = lambda index, path: setattr(h, "current_path", path)
+    h._activate_track_ui = (
+        lambda path, *, library_index=None, queue_token=None:
+        setattr(h, "current_path", path)
+    )
     h._exit_video_fullscreen = lambda: None
     h._sync_now_playing_overlay_for_media_type = lambda: None
     h._announce_accessible_status = lambda _text: None

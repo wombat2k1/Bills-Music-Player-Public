@@ -140,7 +140,11 @@ def test_cast_tick_feeds_adjusted_snapshot_position_to_progress_display():
 
     assert updates == [(27500, 200000)]
     assert window._cast_completion_armed is True
-    assert window._playback_intentionally_paused is False
+    # Astra F2 (Phase 4.1): receiver status is an observation, possibly
+    # delayed, and never overwrites the user's intentional Pause -- only
+    # pause()/Resume and explicit playback do. A "playing" snapshot used to
+    # clear it here, which let a stale snapshot undo Pause and advance.
+    assert window._playback_intentionally_paused is True
 
 
 def test_cast_clock_diagnostics_are_rate_limited_and_include_both_clocks(monkeypatch):

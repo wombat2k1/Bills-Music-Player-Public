@@ -1,7 +1,7 @@
 """The main application window."""
 import bisect
 import dataclasses
-import faulthandler
+import functools
 import gc
 import os
 import re
@@ -88,12 +88,15 @@ from .overlay import JukeboxOverlay, LYRIC_STYLES
 from .loudness import LoudnessCache, calculate_gain, combine_volume, effective_mode, read_replaygain
 from .loudness_worker import LoudnessAnalysisWorker
 from .waveform_worker import WaveformWorker
+from .stall_watchdog import (
+    StallTracebackWatchdog, ensure_diagnostic_closer, hand_off_diagnostic_file,
+)
 from .waveform_widget import WaveformSeekBar
 from .queue_undo import (
     UNDO_ACTION_LABELS, UNDO_STATUS_MESSAGES, GENERIC_UNDO_LABEL,
     capture_queue_undo, snapshot_queue_state, record_undo_snapshot_diagnostics,
 )
-from .queue_dedup import QueueAddOutcome, partition_incoming_batch
+from .queue_dedup import normalize_path_for_comparison, QueueAddOutcome, partition_incoming_batch
 from .library_search import (
     LIBRARY_APPLY_MAX_ALBUMS,
     LIBRARY_APPLY_TIME_BUDGET_SECONDS,
@@ -128,7 +131,7 @@ from .plex_preferences import (
 from .plex_identity import is_plex_identity, parse_plex_identity
 from .plex_metadata import plex_meta_list_to_queue_detail_cache
 from .plex_transport import PlexTransportSource, sanitize_plex_text
-from .playback_attempt import PlaybackAttempt, PlaybackAttemptState
+from .playback_attempt import PlaybackAttempt, PlaybackAttemptState, TERMINAL_STATES
 from .player_lease import PlayerTargetLease
 from .video_transition import (
     EFFECTS as VIDEO_TRANSITION_EFFECTS,
@@ -224,9 +227,21 @@ SHORTCUTS = {
 
 SLEEP_TIMER_TICK_MS = 200
 
+# Phase C2 Stage 2: how long the window stays hidden-but-alive after a
+# close request that found workers the registry could not prove finished.
+# Their `finished` signals can still arrive and complete a normal, fully
+# safe shutdown during this window; if none does, the process force-exits
+# rather than lingering invisibly with native backends still open. Sized
+# well above the longest single registered wait budget (album_art_fetch,
+# 15000ms) so a merely-slow worker still gets to finish properly and only
+# a genuinely stuck one ever reaches the forced path.
+SHUTDOWN_GRACE_MS = 20000
+
 # Diagnostic only: if the GUI thread doesn't return to the event-loop probe
 # (which fires every EVENT_LOOP_PROBE_INTERVAL_MS = 100ms) within this
-# window, faulthandler dumps every thread's live Python stack -- pinpoints
+# window, StallTracebackWatchdog (stall_watchdog.py -- deliberately not
+# faulthandler.dump_traceback_later, which is unsafe while threads run; see
+# that module's docstring) dumps every thread's live Python stack -- pinpoints
 # exactly what's running during the periodic ~250-300ms freezes reported in
 # Party Mode, which sync_from_owner timing and a GC-pause probe have both
 # already ruled out as their own cause.
@@ -431,6 +446,622 @@ class QueueListWidget(QtWidgets.QListWidget):
         super().dropEvent(event)
 
 
+#: Qt item-data role carrying a queue row's stable runtime token. Module
+#: level (rather than only a PlayerWindow method) so the focused
+#: view/controller harnesses, which reuse individual PlayerWindow methods
+#: without inheriting the rest, can still read and write it.
+QUEUE_ENTRY_TOKEN_ROLE = QtCore.Qt.ItemDataRole.UserRole.value + 3
+
+
+def _allocate_queue_entry_tokens_for(owner, count: int):
+    """Allocate `count` fresh, never-reused tokens from `owner`'s counter."""
+    if not hasattr(owner, "_next_queue_entry_token"):
+        owner._next_queue_entry_token = 1
+    start = owner._next_queue_entry_token
+    owner._next_queue_entry_token = start + max(0, count)
+    return list(range(start, start + max(0, count)))
+
+
+def _claim_queue_selection_for(owner, row, *, reason):
+    """Claim `row`'s token under a fresh SELECTION owner; returns
+    (token, selection_owner), or (None, None) if the row has no token.
+
+    Module-level so the selection contract holds on the focused harnesses
+    too -- the point of design A is that selecting a queue row claims it
+    regardless of how, or whether, dispatch is implemented."""
+    token = _queue_token_for_row_of(owner, row)
+    if token is None:
+        return None, None
+    if not hasattr(owner, "_next_queue_selection_id"):
+        owner._next_queue_selection_id = 1
+    selection_owner = _selection_claim_owner(owner._next_queue_selection_id)
+    owner._next_queue_selection_id += 1
+    _claim_queue_entry_token_for(
+        owner, token, attempt_id=selection_owner, reason=f"selection_{reason}",
+    )
+    return token, selection_owner
+
+
+# _next_track reasons that are timer/backend-driven rather than a user command.
+_AUTOMATIC_ADVANCE_REASONS = frozenset({
+    "quiet-end", "near-end", "normal-end", "vlc-ended", "video-ended", "cast-ended",
+})
+
+
+def _automatic_progression_suspended_for(owner) -> bool:
+    """Astra F2: Pause freezes automatic progression until Resume -- no
+    end/near-end/quiet-end trigger, no crossfade or mixed-media fade step, no
+    promotion of prepared incoming media, no automatic advance on an ended
+    callback. _playback_intentionally_paused, the flag pause() toggles, is the
+    authority; explicit user actions (Next, Previous, selection, Stop) are
+    not gated. Module-level for the focused harnesses."""
+    return bool(getattr(owner, "_playback_intentionally_paused", False))
+
+
+def _set_mixed_transition_other_side_paused_for(owner, paused):
+    """pause() pauses the media of the current media type only, but a mixed
+    transition has both sides live: the outgoing audio of an active
+    Audio->Video overlap (media type already VIDEO), the incoming audio of a
+    Video->Audio one, the incoming video still loading for Audio->Video."""
+    if getattr(owner, "_current_media_type", None) == MediaType.VIDEO:
+        for player in owner._built_in_players():
+            try:
+                if paused and player.is_playing():
+                    player.pause()
+                elif not paused and getattr(player, "_paused", False):
+                    player.resume()
+            except Exception:
+                pass
+        return
+    try:
+        if paused:
+            owner._video_backend.pause()
+        else:
+            owner._video_backend.resume()
+    except Exception:
+        pass
+
+
+def _mark_automatic_origin_for(owner, path, reason):
+    """Record on the attempt automatic advancement just dispatched for `path`
+    that it is automatic work (Astra F2) -- asynchronous continuations read
+    it from the attempt they were started for."""
+    attempt = getattr(owner, "_current_playback_attempt", None)
+    if attempt is not None and not attempt.is_terminal() and attempt.source_identity == path:
+        attempt.automatic_reason = reason
+
+
+def _vlc_crossfade_in_flight_for(owner):
+    """The generation of the VLC crossfade whose incoming track is on the
+    inactive player (prebuffering or fading), or None."""
+    if not (getattr(owner, "prebuffer_active", False) or getattr(owner, "fade_active", False)):
+        return None
+    if getattr(owner, "inactive_player", None) is None:
+        return None
+    try:
+        if owner._use_builtin_player():
+            return None
+    except Exception:
+        return None
+    return getattr(owner, "_vlc_crossfade_generation", None)
+
+
+def _pause_vlc_crossfade_incoming_for(owner):
+    """pause() pauses VLC's active player only; a crossfade's incoming track
+    plays silently on the inactive one and would run on through the Pause
+    (Astra F2, Phase 4.2)."""
+    owner._vlc_incoming_paused_generation = None
+    generation = _vlc_crossfade_in_flight_for(owner)
+    if generation is None:
+        return
+    player = owner.inactive_player
+    try:
+        if player.is_playing():
+            player.set_pause(1)
+            owner._vlc_incoming_paused_generation = generation
+    except Exception:
+        pass
+
+
+def _resume_vlc_crossfade_incoming_for(owner):
+    paused_generation = getattr(owner, "_vlc_incoming_paused_generation", None)
+    owner._vlc_incoming_paused_generation = None
+    if paused_generation is None or paused_generation != _vlc_crossfade_in_flight_for(owner):
+        return  # not paused by Pause, or that crossfade is gone (Stop, a new selection)
+    try:
+        owner.inactive_player.set_pause(0)
+    except Exception:
+        pass
+
+
+def _resume_deferred_mixed_activation_for(owner):
+    """A mixed transition whose preparation finished while paused becomes the
+    overlap now -- once, through the same activation (and its content guard)
+    it would have run then."""
+    deferred = getattr(owner, "_mixed_transition_deferred_activation", None)
+    if deferred is None:
+        return
+    owner._mixed_transition_deferred_activation = None
+    if owner._mixed_transition_state != "preparing":
+        return
+    fallback_reason = deferred.get("fallback_reason")
+    if fallback_reason is not None:
+        # A failure held while paused: its fallback runs now, re-validating
+        # the target first (Astra F5) like any other abandonment.
+        owner._abandon_mixed_media_transition_and_fallback(fallback_reason)
+        return
+    lease = deferred.get("lease")
+    if lease is not None:  # Video->Audio: the held incoming audio starts now
+        if not owner._target_lease_still_valid(lease):
+            owner.diagnostics.record(
+                "playback", "player_target_lease_invalid",
+                details={"stage": "mixed_transition_resume"}, minimum_level="basic",
+            )
+            owner._abandon_mixed_media_transition_and_fallback("audio_play_failed")
+            return
+        try:
+            lease.physical_object.play()
+        except Exception as ex:
+            owner._audio_log(f"mixed-transition video->audio resume failed; error={ex}")
+            owner._abandon_mixed_media_transition_and_fallback("audio_play_failed")
+            return
+    owner._activate_mixed_media_transition()
+
+
+def _sync_progression_with_pause_for(owner, was_paused):
+    """Run after every pause()/Resume toggle. Entering Pause: remember when,
+    and pause the other side of a mixed transition. Leaving it: shift the
+    wall-clock fade references by the paused time (a fade continues where it
+    was, rather than completing at once), resume the other side, then let
+    whatever was held while paused proceed exactly once."""
+    paused = _automatic_progression_suspended_for(owner)
+    if paused == bool(was_paused):
+        return
+    now = time.time()
+    in_mixed_transition = getattr(owner, "_mixed_transition_state", "idle") != "idle"
+    if paused:
+        owner._progression_paused_at = now
+        if in_mixed_transition:
+            _set_mixed_transition_other_side_paused_for(owner, True)
+        _pause_vlc_crossfade_incoming_for(owner)
+        return
+    paused_at = getattr(owner, "_progression_paused_at", None)
+    owner._progression_paused_at = None
+    if paused_at is not None:
+        # A reference set during the pause only excludes the time since.
+        mixed_start = getattr(owner, "_mixed_transition_start", None)
+        if mixed_start is not None:
+            owner._mixed_transition_start = mixed_start + (now - max(paused_at, mixed_start))
+        if getattr(owner, "fade_active", False):
+            owner.fade_start = owner.fade_start + (now - max(paused_at, owner.fade_start))
+    if in_mixed_transition:
+        _set_mixed_transition_other_side_paused_for(owner, False)
+    _resume_vlc_crossfade_incoming_for(owner)
+    _resume_deferred_mixed_activation_for(owner)
+    held_fade = getattr(owner, "_deferred_builtin_fade_generation", None)
+    if held_fade is not None:
+        owner._deferred_builtin_fade_generation = None
+        fade_generation, load_token = held_fade
+        if load_token == getattr(owner, "_crossfade_load_token", None):  # not a later crossfade
+            owner._begin_builtin_fade(fade_generation)
+    held_failure = getattr(owner, "_held_crossfade_failure", None)
+    if held_failure is not None:
+        owner._held_crossfade_failure = None
+        owner._on_crossfade_load_failed(*held_failure)
+    held_plex = getattr(owner, "_held_automatic_plex_resolve", None)
+    if held_plex is not None:
+        owner._held_automatic_plex_resolve = None
+        result, attempt_id = held_plex
+        # Re-validated there (attempt and generation), so Stop or a newer
+        # selection since discards it.
+        owner._on_plex_playback_resolved(result, attempt_id)
+    held_vlc_fade = getattr(owner, "_held_vlc_fade_generation", None)
+    if held_vlc_fade is not None:
+        owner._held_vlc_fade_generation = None
+        if held_vlc_fade == getattr(owner, "_vlc_crossfade_generation", None):
+            owner._begin_fade()
+    video_end_generation = getattr(owner, "_paused_video_end_generation", None)
+    if video_end_generation is not None:
+        owner._paused_video_end_generation = None
+        if video_end_generation == owner._playback_generation:
+            owner._on_video_end_of_media()
+
+
+def _syncs_progression_with_pause(toggle):
+    """Decorates pause(): its backends pause/resume as before, then progression
+    that outlives them (fades, held transitions, held ends) follows the new
+    state (Astra F2), however pause() returned."""
+
+    @functools.wraps(toggle)
+    def pause(self):
+        was_paused = bool(self._playback_intentionally_paused)
+        try:
+            return toggle(self)
+        finally:
+            _sync_progression_with_pause_for(self, was_paused)
+
+    return pause
+
+
+def _automatic_retry_suppressed_tokens_for(owner):
+    """Queue tokens whose dispatch already failed synchronously (unavailable
+    file, unsupported source, declined backend switch, disabled video,
+    refused dispatch, ...) in the current advancement context: the same
+    playing generation and the same queue contents.
+
+    The rule: automatic failure suppression prevents repeated timer-driven
+    redispatch, but never overrides a later explicit user playback decision.
+    Only automatic advancement (_AUTOMATIC_ADVANCE_REASONS) passes over these
+    tokens, so a failure is not re-dispatched -- or its prompt reopened --
+    on every tick; Next and direct selection ignore them and may retry. It
+    expires with the context (a new track starts or the queue changes), and
+    never marks, removes or reserves an entry. Per token, so duplicate paths
+    stay independent. Module-level for the focused harnesses."""
+    key = (
+        getattr(owner, "_playback_generation", None),
+        getattr(owner, "_queue_mutation_epoch", None),
+    )
+    record = getattr(owner, "_automatic_retry_suppression", None)
+    if record is None or record[0] != key:
+        record = (key, set())
+        owner._automatic_retry_suppression = record
+    return record[1]
+
+
+def _selection_claim_owner(selection_id):
+    """Claim owner identity for a queue SELECTION, before any
+    PlaybackAttempt exists. Namespaced so it can never equal an integer
+    attempt id or a mixed-transition owner."""
+    return ("selection", selection_id)
+
+
+def _transfer_queue_entry_claim_for(owner, token, *, from_owner, to_owner, reason) -> bool:
+    """Move a claim from one owner to another, only if `from_owner` still
+    holds it. Atomic in the sense that matters here: one dict assignment
+    on the GUI thread, with no window in which the token is unowned."""
+    if token is None or to_owner is None:
+        return False
+    claims = getattr(owner, "_queue_entry_claims", None)
+    if not claims or token not in claims:
+        return False
+    current = claims[token]
+    if from_owner is not None and current != from_owner:
+        return False
+    claims[token] = to_owner
+    _record_queue_claim_event_for(
+        owner, "entry_claim_transferred", token, to_owner, reason,
+        previous_owner=current,
+    )
+    return True
+
+
+@dataclasses.dataclass(frozen=True)
+class CastRequest:
+    """Immutable identity of one Cast operation (Astra F11), created when the
+    operation starts and carried through CastPlaybackController's connect/load
+    worker and back on its request_* signals. `attempt_id` is the
+    PlaybackAttempt the operation was started for (None if none was live)."""
+
+    request_id: int
+    attempt_id: Optional[int]
+    purpose: str
+
+
+def _begin_cast_request_for(owner, purpose):
+    """Start a Cast operation: it becomes the only one with authority,
+    superseding any earlier one. The single slot is the only bookkeeping --
+    a superseded request is simply no longer referenced by the window."""
+    owner._next_cast_request_id = getattr(owner, "_next_cast_request_id", 0) + 1
+    attempt = getattr(owner, "_current_playback_attempt", None)
+    attempt_id = (
+        attempt.attempt_id if attempt is not None and not attempt.is_terminal() else None
+    )
+    request = CastRequest(owner._next_cast_request_id, attempt_id, purpose)
+    owner._cast_current_request = request
+    return request
+
+
+def _invalidate_cast_request_for(owner, reason):
+    """Revoke the authority of any outstanding Cast operation (Stop, return
+    to local output, ...). Its completion may still arrive; it will be
+    dropped by _cast_request_has_authority_for."""
+    request = getattr(owner, "_cast_current_request", None)
+    if request is None:
+        return
+    owner._cast_current_request = None
+    diagnostics = getattr(owner, "diagnostics", None)
+    if diagnostics is not None:
+        diagnostics.record(
+            "cast", "cast_request_invalidated",
+            details={"request_id": request.request_id, "reason": reason},
+            minimum_level="detailed",
+        )
+
+
+def _cast_request_has_authority_for(owner, request, stage):
+    """True only for the Cast operation that is still current AND whose
+    originating PlaybackAttempt is still current and live. Checked before
+    a Cast completion has any effect.
+
+    "Still current" is kept by explicit revocation of the single slot at
+    every conflicting user intent -- Stop, choosing This Computer, returning
+    to or forcing local output, any new PlaybackAttempt, a newer Cast
+    request -- so a request with attempt_id=None (an output switch with no
+    live attempt) is superseded by those exactly like one that has an
+    attempt."""
+    current = getattr(owner, "_cast_current_request", None)
+    authoritative = request is not None and request is current
+    if authoritative and request.attempt_id is not None:
+        attempt = getattr(owner, "_current_playback_attempt", None)
+        authoritative = (
+            attempt is not None
+            and attempt.attempt_id == request.attempt_id
+            and not attempt.is_terminal()
+        )
+    if not authoritative:
+        diagnostics = getattr(owner, "diagnostics", None)
+        if diagnostics is not None:
+            diagnostics.record(
+                "cast", "cast_completion_stale_dropped",
+                details={
+                    "stage": stage,
+                    "request_id": getattr(request, "request_id", None),
+                    "current_request_id": getattr(current, "request_id", None),
+                },
+                minimum_level="detailed",
+            )
+    return authoritative
+
+
+def _mixed_transition_claim_owner(transition_id):
+    """Claim owner identity for a mixed-media transition. Namespaced so it
+    can never be equal to a PlaybackAttempt id."""
+    return ("mixed_transition", transition_id)
+
+
+# A mixed transition abandoned for one of these reasons no longer represents
+# what the queue holds, so its captured target must never be played by the
+# hard-cut fallback (Astra F5). Any other reason is a preparation/backend
+# failure for a target that may still be valid -- see
+# _abandon_mixed_media_transition_and_fallback, which also re-checks identity.
+_MIXED_TRANSITION_INVALIDATION_REASONS = frozenset({"incoming_source_changed"})
+
+
+def _queue_claims_owned_by_for(owner, claim_owner):
+    """Every queue token currently reserved by `claim_owner`."""
+    claims = getattr(owner, "_queue_entry_claims", None) or {}
+    return [token for token, holder in claims.items() if holder == claim_owner]
+
+
+def _release_queue_claims_owned_by_for(owner, claim_owner, *, reason, keep=None):
+    """Terminal cleanup for an owner that is going away: release every
+    reservation it still holds, except `keep` (one being handed on)."""
+    for token in _queue_claims_owned_by_for(owner, claim_owner):
+        if token != keep:
+            _release_queue_entry_claim_for(owner, token, attempt_id=claim_owner, reason=reason)
+
+
+def _hand_off_abandoned_mixed_claims_for(owner, from_owner, tokens, *, reason):
+    """Resolve reservations a cancelled mixed transition still held once its
+    replacement has been selected (Astra F4). They were kept through that
+    selection so Next moved PAST the abandoned entries. If the replacement is
+    itself a mixed transition, it takes them over -- so a rapid Next does not
+    bounce back to what was just skipped -- and releases them at its own end
+    (see _release_queue_claims_owned_by_for callers). Otherwise they are
+    released, leaving the entries unplayed and selectable. Never touches a
+    token some other owner now holds."""
+    if not tokens:
+        return
+    successor = None
+    if getattr(owner, "_mixed_transition_state", "idle") != "idle":
+        successor = _mixed_transition_claim_owner(owner._mixed_transition_id)
+    for token in tokens:
+        if _queue_entry_claim_owner_of(owner, token) != from_owner:
+            continue
+        if successor is not None and successor != from_owner:
+            _transfer_queue_entry_claim_for(
+                owner, token, from_owner=from_owner, to_owner=successor,
+                reason=f"skipped_past_{reason}",
+            )
+        else:
+            _release_queue_entry_claim_for(
+                owner, token, attempt_id=from_owner, reason=f"abandoned_{reason}",
+            )
+
+
+def _queue_entry_claim_owner_of(owner, token):
+    if token is None:
+        return None
+    return (getattr(owner, "_queue_entry_claims", None) or {}).get(token)
+
+
+def _queue_entry_still_holds_source(owner, token, expected_source) -> bool:
+    """True when the queue entry `token` identifies still holds the source
+    that was prepared for it.
+
+    Token LOCATES the logical queue entry; this validates its CONTENT.
+    Both are needed and neither substitutes for the other: missing-track
+    repair deliberately preserves an entry's token while replacing its
+    path, so a surviving token alone does not prove the prepared media
+    still belongs to that entry. Conversely a path must never be used to
+    FIND the entry, because duplicate identical paths are legal.
+
+    Uses the project's existing canonical comparison (case-insensitive on
+    Windows, slash-normalised, filesystem-free) rather than any ad-hoc
+    normalisation of its own."""
+    if token is None or not expected_source:
+        return False
+    row = _queue_row_for_token_of(owner, token)
+    if row is None:
+        return False
+    queue = getattr(owner, "queue", ())
+    if not (0 <= row < len(queue)):
+        return False
+    return (
+        normalize_path_for_comparison(queue[row])
+        == normalize_path_for_comparison(expected_source)
+    )
+
+
+def _queue_row_for_token_of(owner, token):
+    """Token -> its CURRENT row, tolerant of a focused harness. Returns
+    None when the entry has left the queue, which is the authoritative
+    "gone" signal (tokens are never reused, so this can never silently
+    resolve to a different row)."""
+    if token is None:
+        return None
+    _bootstrap_queue_entry_tokens(owner)
+    tokens = getattr(owner, "_queue_entry_tokens", ())
+    try:
+        return list(tokens).index(token)
+    except ValueError:
+        return None
+
+
+def _queue_token_for_row_of(owner, row):
+    """Row -> token, tolerant of a focused harness that carries no token
+    list at all (it simply has no queue identity to offer)."""
+    if row is None:
+        return None
+    _bootstrap_queue_entry_tokens(owner)
+    tokens = getattr(owner, "_queue_entry_tokens", ())
+    if 0 <= row < len(tokens):
+        return tokens[row]
+    return None
+
+
+def _record_queue_claim_event_for(owner, operation, token, attempt_id, reason, **extra):
+    diagnostics = getattr(owner, "diagnostics", None)
+    if diagnostics is None:
+        return
+    details = {"token": token, "attempt_id": attempt_id, "reason": reason}
+    details.update(extra)
+    try:
+        diagnostics.record("queue", operation, details=details, minimum_level="detailed")
+    except Exception:
+        pass
+
+
+def _claim_queue_entry_token_for(owner, token, *, attempt_id, reason):
+    """Module-level so the attempt lifecycle works on the focused
+    harnesses that borrow individual PlayerWindow methods."""
+    if token is None or attempt_id is None:
+        return
+    if not hasattr(owner, "_queue_entry_claims"):
+        owner._queue_entry_claims = {}
+    owner._queue_entry_claims[token] = attempt_id
+    _record_queue_claim_event_for(owner, "entry_claimed", token, attempt_id, reason)
+
+
+def _release_queue_entry_claim_for(owner, token, *, attempt_id, reason) -> bool:
+    """Release only if `attempt_id` still OWNS the claim -- see
+    PlayerWindow._release_queue_entry_claim for why ownership matters."""
+    if token is None:
+        return False
+    claims = getattr(owner, "_queue_entry_claims", None)
+    if not claims or token not in claims:
+        return False
+    current_owner = claims[token]
+    if attempt_id is not None and current_owner != attempt_id:
+        _record_queue_claim_event_for(
+            owner, "entry_claim_release_refused", token, attempt_id, reason,
+            current_owner=current_owner,
+        )
+        return False
+    del claims[token]
+    _record_queue_claim_event_for(owner, "entry_claim_released", token, attempt_id, reason)
+    return True
+
+
+def _release_attempt_queue_claim_for(owner, attempt, *, reason) -> bool:
+    if attempt is None:
+        return False
+    return _release_queue_entry_claim_for(
+        owner, getattr(attempt, "queue_entry_id", None),
+        attempt_id=getattr(attempt, "attempt_id", None), reason=reason,
+    )
+
+
+def _commit_queue_entry_token_for(owner, token, *, attempt_id, reason):
+    """Module-level commit, callable on the focused harnesses that borrow
+    individual PlayerWindow methods. Falls back to a plain claim release
+    when `owner` carries no queue state at all."""
+    if token is None:
+        return None
+    if not hasattr(owner, "queue"):
+        _release_queue_entry_claim_for(owner, token, attempt_id=attempt_id, reason=reason)
+        return None
+    return PlayerWindow._commit_queue_entry_token(
+        owner, token, attempt_id=attempt_id, reason=reason,
+    )
+
+
+def _commit_attempt_queue_entry_for(owner, attempt, *, reason):
+    """Commit an attempt's queue entry. Falls back to a plain claim
+    release when `owner` carries no queue state at all (a focused
+    harness), so the lifecycle stays callable there."""
+    if attempt is None:
+        return None
+    token = getattr(attempt, "queue_entry_id", None)
+    if token is None:
+        return None
+    if not hasattr(owner, "queue"):
+        _release_attempt_queue_claim_for(owner, attempt, reason=reason)
+        return None
+    return PlayerWindow._commit_queue_entry_token(
+        owner, token, attempt_id=getattr(attempt, "attempt_id", None), reason=reason,
+    )
+
+
+def _prune_queue_entry_claims_for(owner, operation: str) -> None:
+    """Drop claims for tokens that genuinely left the queue. Module-level
+    so it works on the focused harnesses that reuse individual
+    PlayerWindow methods without inheriting the rest."""
+    claims = getattr(owner, "_queue_entry_claims", None)
+    if not claims:
+        return
+    live = set(getattr(owner, "_queue_entry_tokens", ()))
+    dropped = set(claims) - live
+    if not dropped:
+        return
+    owner._queue_entry_claims = {
+        token: holder for token, holder in claims.items() if token in live
+    }
+    diagnostics = getattr(owner, "diagnostics", None)
+    if diagnostics is not None:
+        diagnostics.record(
+            "queue", "entry_claims_pruned",
+            details={"operation": operation, "dropped": sorted(dropped)},
+            minimum_level="detailed",
+        )
+
+
+def _bootstrap_queue_entry_tokens(owner) -> None:
+    """Give `owner` a usable queue-entry token list if it has never had
+    one. Works on any object carrying a `queue` list -- PlayerWindow
+    itself and the focused view/controller harnesses alike.
+
+    Bootstrap only: a queue with NO tokens and a non-empty queue is
+    legitimate first use (a restored session, a partial harness, a
+    pre-token queue) and gets a full allocation. A queue that already has
+    tokens but the wrong number of them is identity corruption and is
+    deliberately left untouched, so _assert_queue_entry_tokens_aligned
+    fails closed on it instead of this inventing replacements that would
+    let an async completion commit the wrong track.
+    """
+    if not hasattr(owner, "_queue_entry_tokens"):
+        owner._queue_entry_tokens = []
+    if not hasattr(owner, "_next_queue_entry_token"):
+        owner._next_queue_entry_token = 1
+    if not hasattr(owner, "_queue_entry_claims"):
+        owner._queue_entry_claims = {}
+    queue = getattr(owner, "queue", None) or []
+    if not owner._queue_entry_tokens and queue:
+        start = owner._next_queue_entry_token
+        owner._queue_entry_tokens = list(range(start, start + len(queue)))
+        owner._next_queue_entry_token = start + len(queue)
+
+
 class PlayerWindow(QtWidgets.QMainWindow):
     startup_ready = QtCore.pyqtSignal()
     startup_failed = QtCore.pyqtSignal(str)
@@ -456,6 +1087,9 @@ class PlayerWindow(QtWidgets.QMainWindow):
         self._memory_probe_timer = None
         self._gc_pause_started = None
         self._fault_dump_file = None
+        self._stall_watchdog = None
+        self._diagnostic_closer = None
+        self._stall_dump_disabled = False
         self._first_paint_emitted = False
         self.setWindowTitle(APP_TITLE)
         self.setWindowIcon(QtGui.QIcon(resource_path(os.path.join("assets", "app_icon.ico"))))
@@ -469,7 +1103,26 @@ class PlayerWindow(QtWidgets.QMainWindow):
         # debug steps (logged after UI built)
 
         self.tracks: List[str] = []
-        self.current_index: Optional[int] = None
+        # Phase D: the old single `current_index` was written by
+        # _activate_track_ui with whatever its caller passed -- a LIBRARY
+        # index from ten call sites, a QUEUE ROW from the two mixed-media
+        # ones -- and read back as a library index (self.tracks[...]).
+        # Split into two explicitly named identities that may both be set
+        # at once: a queue-played local-library track legitimately has a
+        # library index AND a queue token.
+        #
+        # current_library_index is POSITIONAL and perishable -- a rescan
+        # rebuilds self.tracks, so it is recomputed from current_path (the
+        # durable library-side identity) and never carried across a
+        # rebuild.
+        self.current_library_index: Optional[int] = None
+        # current_queue_token is the Phase B stable queue identity. It may
+        # outlive its queue entry: _queue_row_for_token() returning None is
+        # the authoritative "no longer present" signal. Never rediscovered
+        # from path; tokens are never reused within the process, so a
+        # departed token can only ever resolve to None, never to a
+        # different row.
+        self.current_queue_token: Optional[int] = None
         self.current_path: Optional[str] = None
         # Detail workers capture this identity.  It advances only when the
         # application makes a different item authoritative/current.
@@ -736,10 +1389,17 @@ class PlayerWindow(QtWidgets.QMainWindow):
         #   _shutdown_complete: FINALIZE-shutdown has actually run to
         #     completion -- only once this is True may closeEvent accept
         #     the close for real.
+        #   _shutdown_grace_timer: the single, never-re-armed grace timer
+        #     started when the first close request finds unresolved
+        #     workers (Stage 2). Cancelled if the last worker resolves
+        #     normally before it fires; on expiry the process is force-
+        #     exited rather than pretending native teardown is safe while
+        #     an unproven worker may still be inside a native call.
         self._shutdown_requested = False
         self._shutdown_pending = False
         self._shutdown_finalizing = False
         self._shutdown_complete = False
+        self._shutdown_grace_timer = None
         self._worker_registry = WorkerLifetimeRegistry(diagnostics=self.diagnostics)
         self._visualiser_lifecycle = VisualiserLifecycleController("main_window")
         self._analyzer_feed_lifecycle = VisualiserLifecycleController("analyzer_feed")
@@ -755,6 +1415,10 @@ class PlayerWindow(QtWidgets.QMainWindow):
         self._cast_payload_cache: Dict[str, dict] = {}
         self._cast_artwork_paths: Dict[str, str] = {}
         self._cast_payload_generation = 0
+        # Astra F11: the one Cast operation (CastRequest) whose completion
+        # may still act; see _begin_cast_request_for.
+        self._cast_current_request = None
+        self._next_cast_request_id = 0
         self._cast_payload_workers: list = []
         self._cast_clock_diagnostic_at = 0.0
         self.cast_discovery = CastDiscoveryService(self)
@@ -873,6 +1537,36 @@ class PlayerWindow(QtWidgets.QMainWindow):
         # see CODEX_HANDOFF.md on why that's deliberately not being added
         # opportunistically here).
         self._queue_mutation_epoch = 0
+        # Phase B (queue-commit semantics): one stable runtime token per
+        # queue row, index-aligned with queue/queue_played/
+        # queue_playlist_entries. A token identifies WHICH queue entry an
+        # async attempt selected, surviving every reorder -- including
+        # _mark_queue_row_played's own relocation, which is what makes a
+        # row number useless as identity. Tokens are never reused within
+        # the process, so a stale completion holding a dead token can
+        # never resolve to a live row. Duplicate identical paths are
+        # legal and get distinct tokens; identity is NEVER matched by
+        # path. This is deliberately a parallel list, not the row-object
+        # redesign -- that is Phase D.
+        self._queue_entry_tokens: List[int] = []
+        self._next_queue_entry_token = 1
+        # token -> owning PlaybackAttempt id, for tokens an in-flight
+        # attempt has reserved but not yet committed. A claimed row is
+        # skipped by _next_unplayed_queue_row (so Manual Next moves PAST a
+        # still-preparing track) but its queue position and played flag
+        # are untouched until the attempt genuinely becomes authoritative.
+        #
+        # It maps to an OWNER rather than being a bare set specifically so
+        # a recovery/fallback handoff is expressible: the replacement
+        # attempt takes ownership of the same token, and the original
+        # attempt's own FAILED cleanup then finds it is no longer the
+        # owner and releases nothing. A set could not distinguish "my
+        # claim" from "the claim my replacement now holds".
+        self._queue_entry_claims: Dict[int, object] = {}
+        # Monotonic id for each queue SELECTION, so a selection can own a
+        # claim before any PlaybackAttempt exists and hand it over once
+        # one does.
+        self._next_queue_selection_id = 1
         self._video_transition_manager = None
         self._video_backend = QtVideoPlaybackBackend(self)
         self._video_backend.started.connect(self._on_video_started)
@@ -946,12 +1640,24 @@ class PlayerWindow(QtWidgets.QMainWindow):
         self._mixed_transition_direction = None  # "audio_to_video" | "video_to_audio"
         self._mixed_transition_outgoing_path = None
         self._mixed_transition_incoming_path = None
-        self._mixed_transition_incoming_row = None
+        self._mixed_transition_incoming_token = None
         self._mixed_transition_reason = None
         self._mixed_transition_start = None
         self._mixed_transition_video_audio_scale = 0.0
         self._mixed_transition_gain_token = None
         self._mixed_transition_load_worker = None
+        # Astra F2: progression held while paused, resumed by
+        # _sync_progression_with_pause_for.
+        self._mixed_transition_deferred_activation = None
+        self._deferred_builtin_fade_generation = None
+        self._paused_video_end_generation = None
+        self._progression_paused_at = None
+        self._held_automatic_plex_resolve = None
+        self._vlc_crossfade_generation = 0
+        self._builtin_crossfade_attempt_id = None
+        self._held_crossfade_failure = None
+        self._held_vlc_fade_generation = None
+        self._vlc_incoming_paused_generation = None
         # v1.0.71 correction: which of the 25/50/75% audio-state diagnostic
         # checkpoints (see _probe_mixed_video_audio_state) have already
         # fired for the *current* Audio->Video transition -- reset per
@@ -1156,6 +1862,7 @@ class PlayerWindow(QtWidgets.QMainWindow):
             intro_transition_point_lookup=self._video_transition_point_analyzer.cached_intro_start_ms,
             current_primary_path_provider=lambda: getattr(self, "current_path", None),
             staleness_identity_provider=self._peek_next_queue_identity_for_dual_transition_pure,
+            automatic_progress_suspended=lambda: _automatic_progression_suspended_for(self),
         )
         self._video_transition_manager = VideoTransitionManager(
             self,
@@ -1164,6 +1871,7 @@ class PlayerWindow(QtWidgets.QMainWindow):
             self._peek_next_media_type_for_transition,
             self._record_video_transition_event,
             dual_engine=dual_transition_engine,
+            automatic_progress_suspended=lambda: _automatic_progression_suspended_for(self),
         )
         self._build_accessible_actions()
         self._configure_accessibility()
@@ -1454,33 +2162,66 @@ class PlayerWindow(QtWidgets.QMainWindow):
         # consecutive event-loop probes, dump every thread's live stack to
         # stall_traceback.log so the next freeze report captures exactly
         # what the interpreter was doing, not just that it happened.
+        #
+        # Diagnostics are optional; shutdown is not. The closer that will
+        # later take this file off the shutdown thread must already be
+        # running before the file is opened -- if it cannot be started,
+        # stall dumps are disabled for this run and no file is ever owned.
+        if getattr(self, "_stall_dump_disabled", False):
+            return
         if self._fault_dump_file is None:
             path = self._fault_dump_path()
             if path is None:
                 return
+            closer = ensure_diagnostic_closer()
+            if closer is None:
+                self._stall_dump_disabled = True
+                return
+            self._diagnostic_closer = closer
             try:
                 self._fault_dump_file = open(path, "a", encoding="utf-8")
             except OSError:
                 return
+        if self._stall_watchdog is None:
+            try:
+                self._stall_watchdog = StallTracebackWatchdog(
+                    STALL_DUMP_THRESHOLD_S, self._fault_dump_file,
+                    closer=getattr(self, "_diagnostic_closer", None),
+                )
+            except Exception:
+                # The watchdog's own thread could not start: give the
+                # just-opened file straight to the closer and stop trying.
+                dump_file = self._fault_dump_file
+                self._fault_dump_file = None
+                self._stall_dump_disabled = True
+                hand_off_diagnostic_file(dump_file, getattr(self, "_diagnostic_closer", None))
+                return
         try:
-            faulthandler.cancel_dump_traceback_later()
-            faulthandler.dump_traceback_later(
-                STALL_DUMP_THRESHOLD_S, exit=False, file=self._fault_dump_file,
-            )
+            self._stall_watchdog.heartbeat()
         except Exception:
             pass
 
     def _cancel_stall_dump(self):
-        try:
-            faulthandler.cancel_dump_traceback_later()
-        except Exception:
-            pass
-        if self._fault_dump_file is not None:
+        # Bounded: stop() never waits longer than its timeout, even if the
+        # watchdog is stuck in a blocked log write or the final close blocks
+        # flushing buffered output. A watchdog owns closing the file it
+        # writes to (closed once, never under a write in progress, never on
+        # this thread), so this must not close it itself. Nothing here starts
+        # a thread: files go to the closer started with the diagnostics.
+        watchdog = self._stall_watchdog
+        self._stall_watchdog = None
+        dump_file = self._fault_dump_file
+        self._fault_dump_file = None
+        if watchdog is not None:
             try:
-                self._fault_dump_file.close()
+                watchdog.stop(close_file=True)
             except Exception:
                 pass
-            self._fault_dump_file = None
+            return
+        if dump_file is not None:
+            # No watchdog ever wrote to it; still never close it here, nor
+            # drop its last reference here (that finalises it on this thread).
+            hand_off_diagnostic_file(dump_file, getattr(self, "_diagnostic_closer", None))
 
     def _install_gc_pause_probe(self):
         # Diagnostic only: confirms/rules out Python's own garbage collector
@@ -1690,6 +2431,11 @@ class PlayerWindow(QtWidgets.QMainWindow):
             return
         self.queue, self.queue_played, self.current_path = restored
         self.queue_playlist_entries = [None] * len(self.queue)
+        # Tokens are runtime-only and deliberately not serialised: they
+        # identify in-process async work, nothing more. A restored queue
+        # therefore gets a controlled fresh allocation -- the sanctioned
+        # kind of invention, not a self-heal.
+        self._initialise_queue_entry_tokens("session_restore")
         self._ensure_queue_played_flags()
         # This refresh occurs before queue-analysis workers exist and never starts playback.
         self._refresh_queue_list(
@@ -1784,7 +2530,7 @@ class PlayerWindow(QtWidgets.QMainWindow):
         self._cancel_fade()
         try:
             if self._mixed_transition_state != "idle":
-                self._cancel_mixed_media_transition("shutdown")
+                self._cancel_mixed_media_transition("shutdown", release_incoming_claim=True)
         except Exception:
             pass
         try:
@@ -1859,6 +2605,13 @@ class PlayerWindow(QtWidgets.QMainWindow):
         if self._shutdown_finalizing:
             return
         self._shutdown_finalizing = True
+        # NB: the grace timer is deliberately NOT cancelled here. Both
+        # routes into final teardown have already disarmed it -- closeEvent
+        # calls _cancel_shutdown_grace_timer() immediately before this, and
+        # _on_shutdown_grace_expired() clears the reference as its first
+        # action (the single-shot timer has fired by then anyway). Adding a
+        # third cancel here would only couple _finalize_shutdown to a
+        # collaborator it does not otherwise need.
         finalize_started = time.perf_counter()
         try:
             try:
@@ -1956,7 +2709,96 @@ class PlayerWindow(QtWidgets.QMainWindow):
         time the registry is empty, so closeEvent finalizes for real. A
         no-op during normal (non-shutdown) operation."""
         if self._shutdown_pending and self._worker_registry.active_count() == 0:
+            # Stage 2 ended the good way: every worker proved itself
+            # finished inside the grace period, so the forced-exit path
+            # must be disarmed before the normal close runs.
+            self._cancel_shutdown_grace_timer()
             self.close()
+
+    def _arm_shutdown_grace_timer(self) -> None:
+        """Starts the single Stage 2 grace timer. Its own method purely so
+        the Qt object construction is one substitutable seam -- closeEvent
+        stays unit-testable against a plain fake window, exactly as
+        _force_process_exit keeps the terminating call substitutable."""
+        timer = QtCore.QTimer(self)
+        timer.setSingleShot(True)
+        timer.timeout.connect(self._on_shutdown_grace_expired)
+        timer.start(SHUTDOWN_GRACE_MS)
+        self._shutdown_grace_timer = timer
+
+    def _cancel_shutdown_grace_timer(self) -> None:
+        """Disarms the single Stage 2 grace timer, if one is armed. Safe
+        to call when none was ever started, and safe to call twice."""
+        timer = self._shutdown_grace_timer
+        self._shutdown_grace_timer = None
+        if timer is not None:
+            try:
+                timer.stop()
+            except Exception:
+                pass
+
+    def _force_process_exit(self, exit_code: int) -> None:
+        """Last-resort process termination for the Stage 2 grace-expiry
+        path. Separated into its own one-line method purely so tests can
+        replace it and assert it WOULD have been called without actually
+        killing the test runner.
+
+        os._exit() specifically, and deliberately: it terminates the
+        process immediately without unwinding the stack, running atexit
+        handlers, flushing Python-level state or letting Qt/BASS run any
+        teardown. That is exactly the required behaviour here -- we reach
+        this point only when a worker could not be proven finished, so a
+        normal teardown might free native resources that worker is still
+        inside. sys.exit() would raise SystemExit, which a Qt timer slot
+        swallows (so the app would simply keep running), and
+        QApplication.quit() would return to normal teardown, which is the
+        precise thing this path exists to avoid. The same reasoning and
+        the same call already back the overall watchdog in
+        video_transition_point_probe_subprocess.py."""
+        os._exit(exit_code)
+
+    def _on_shutdown_grace_expired(self) -> None:
+        """Stage 2 grace timer fired. Re-checks the registry first: a
+        worker may have resolved between the timer firing and this slot
+        running, in which case the normal, fully-safe teardown still
+        applies and nothing is forced."""
+        self._shutdown_grace_timer = None
+        if self._shutdown_complete:
+            return
+        if self._worker_registry.active_count() == 0:
+            self._finalize_shutdown()
+            try:
+                self.close()
+            except Exception:
+                pass
+            return
+        stuck = self._worker_registry.active_workers()
+        try:
+            self.diagnostics.record(
+                "worker_lifetime", "shutdown_forced_exit",
+                details={
+                    "unproven_workers": [
+                        {"worker_id": token, "category": category}
+                        for token, category in stuck
+                    ],
+                    "unproven_count": len(stuck),
+                },
+                severity="warning",
+                minimum_level="basic",
+            )
+            self.diagnostics.shutdown()
+        except Exception:
+            pass
+        self._audio_log(
+            "shutdown grace expired with unproven workers "
+            f"({', '.join(category for _, category in stuck) or 'unknown'}); forcing exit"
+        )
+        # Deliberately NOT _finalize_shutdown(): every resource it would
+        # close (BASS/miniaudio streams, the video backend, the Cast media
+        # server) may still be in use by whichever worker could not be
+        # proven finished. Freeing them here is the native-use-after-free
+        # this whole phase exists to prevent. The OS reclaims all of it.
+        self._force_process_exit(0)
 
     def closeEvent(self, event):
         # The one authoritative "the application is closing" flag (v1.0.66
@@ -2005,15 +2847,29 @@ class PlayerWindow(QtWidgets.QMainWindow):
             self._request_shutdown()
 
         if self._worker_registry.active_count() == 0:
+            # Stage 1: every worker proved finished inside the bounded
+            # aggregate join -- normal, fully-safe teardown.
+            self._cancel_shutdown_grace_timer()
             self._finalize_shutdown()
             event.accept()
             super().closeEvent(event)
         else:
+            # Stage 2: workers remain unproven. Keep the event loop alive
+            # so their finished signals can still be delivered (that is
+            # what _maybe_resume_final_shutdown waits for), but arm ONE
+            # grace timer so an unresolvable worker cannot leave the
+            # process alive and invisible forever.
             self._shutdown_pending = True
             try:
                 self.hide()
             except Exception:
                 pass
+            # Exactly one, ever: a second close request (the user clicking
+            # the X again on the still-hidden window, or any programmatic
+            # close()) must NOT restart the grace period, or a repeatedly
+            # closed app could postpone the forced exit indefinitely.
+            if self._shutdown_grace_timer is None:
+                self._arm_shutdown_grace_timer()
             event.ignore()
 
     def _build_library_tree_widget(self) -> QtWidgets.QTreeWidget:
@@ -2952,6 +3808,18 @@ class PlayerWindow(QtWidgets.QMainWindow):
         # finish on its own schedule, but _is_current_playback_attempt
         # will reject it from this point on.
         self._cancel_current_playback_attempt("stop_playback")
+        # Astra F11: likewise any outstanding Cast connect/load -- revoked
+        # before teardown, so a completion delivered after Stop has no effect.
+        _invalidate_cast_request_for(self, "stop_playback")
+        # A mixed-media transition holds its own authority, independent of
+        # the PlaybackAttempt cancelled above -- revoke it too, before any
+        # physical teardown, so a late preparation result or fade tick
+        # finds the transition idle and cannot restart or promote anything.
+        if getattr(self, "_mixed_transition_state", "idle") != "idle":
+            self._cancel_mixed_media_transition(
+                "stop_playback", release_incoming_claim=True,
+                exit_video_fullscreen=True,
+            )
         transition_manager = getattr(self, "_video_transition_manager", None)
         if transition_manager is not None:
             transition_manager.playback_stopped()
@@ -3972,8 +4840,19 @@ class PlayerWindow(QtWidgets.QMainWindow):
             self.output_combo.setCurrentIndex(0 if not self.cast_active else row)
             return
         if choice is None:
+            # The user has made local output authoritative. A switch that is
+            # still connecting or loading has not set cast_active yet, so it
+            # must be abandoned here -- otherwise its completion still arrives
+            # current and takes the output (Astra F11). Its request is the
+            # only outstanding one: a Cast track request exists only while
+            # cast_active, and _return_to_local_output revokes that itself.
             if self.cast_active:
                 self._return_to_local_output()
+            elif getattr(self, "_cast_current_request", None) is not None:
+                _invalidate_cast_request_for(self, "local_output_selected")
+                snapshot, self._cast_pending_snapshot = self._cast_pending_snapshot, None
+                self._cast_pending_device = None
+                self._resume_local_snapshot(snapshot)  # undo the switch's pause
             return
         if self.cast_active and self._cast_pending_device == choice:
             return
@@ -4090,7 +4969,8 @@ class PlayerWindow(QtWidgets.QMainWindow):
         self._pause_local_for_cast()
         self._cast_pending_snapshot = snapshot
         self._cast_pending_device = device
-        self.cast_controller.connect_device(device)
+        request = _begin_cast_request_for(self, "output_switch")
+        self.cast_controller.connect_device(device, request=request)
 
     def _ensure_cast_artwork_temp_dir(self) -> str:
         if self._cast_artwork_temp is None:
@@ -4147,6 +5027,10 @@ class PlayerWindow(QtWidgets.QMainWindow):
         track (Codex-reported "old-track Cast race")."""
         if getattr(self, "_closing", False):
             return
+        # Astra F11: this load belongs to the Cast operation that is current
+        # right now -- the one the caller has just started or validated --
+        # and its completion must come back tagged with it.
+        cast_request = getattr(self, "_cast_current_request", None)
         self._cast_payload_generation += 1
         generation = self._cast_payload_generation
         self.diagnostics.record(
@@ -4162,7 +5046,9 @@ class PlayerWindow(QtWidgets.QMainWindow):
                 minimum_level="detailed",
             )
             payload = self._cast_payload_with_fresh_artwork(path, cached)
-            self.cast_controller.load_async(media_url, content_type, payload, position, autoplay)
+            self.cast_controller.load_async(
+                media_url, content_type, payload, position, autoplay, request=cast_request,
+            )
             return
         artwork_dir = self._ensure_cast_artwork_temp_dir()
         worker = CastPayloadWorker(generation, path, artwork_dir)
@@ -4190,8 +5076,20 @@ class PlayerWindow(QtWidgets.QMainWindow):
                         minimum_level="detailed",
                     )
                 return
+            # Astra F11: the generation above only says this is the newest
+            # metadata result; Stop, choosing This Computer, newer playback or
+            # another Cast request revoke the Cast operation without changing
+            # it. A revoked operation starts no further Cast work (artwork
+            # registration, load_async). A load with no captured request (a
+            # direct call outside any Cast operation) has nothing to revoke.
+            if cast_request is not None and not _cast_request_has_authority_for(
+                self, cast_request, "payload_ready",
+            ):
+                return
             final_payload = self._cast_payload_with_fresh_artwork(ready_path, payload)
-            self.cast_controller.load_async(media_url, content_type, final_payload, position, autoplay)
+            self.cast_controller.load_async(
+                media_url, content_type, final_payload, position, autoplay, request=cast_request,
+            )
 
         def _on_finished(worker=worker, token=token):
             if worker in self._cast_payload_workers:
@@ -4202,9 +5100,11 @@ class PlayerWindow(QtWidgets.QMainWindow):
         worker.finished.connect(_on_finished)
         worker.start()
 
-    def _on_cast_connected(self, device):
+    def _on_cast_connected(self, device, request=None):
         if getattr(self, "_closing", False):
             return
+        if not _cast_request_has_authority_for(self, request, "connected"):
+            return  # Stop/return to local/a newer request happened meanwhile
         snapshot = self._cast_pending_snapshot or {}
         path = snapshot.get("path")
         try:
@@ -4216,11 +5116,30 @@ class PlayerWindow(QtWidgets.QMainWindow):
                 snapshot.get("position", 0.0), snapshot.get("playing", False),
             )
         except Exception as ex:
-            self._on_cast_failed(str(ex))
+            self._on_cast_failed(str(ex), request)
 
-    def _on_cast_loaded(self):
+    def _on_cast_loaded(self, request=None):
+        """Receiver confirmation -- the Cast device reports the media is
+        actually loaded and active (CastController._load_worker emits
+        `loaded` only after pychromecast's own bounded
+        block_until_active(timeout=10) returns). This, not dispatch, is
+        the authoritative moment for a Cast track.
+
+        Astra F11: the controller's generation check runs on its worker
+        thread BEFORE the queued signal reaches this GUI handler, so a
+        confirmation already emitted when Stop, a return to local output, a
+        new selection or another Cast request happened still arrives here.
+        It is dropped -- before any effect -- unless `request` is still the
+        current Cast operation and its own PlaybackAttempt is still current,
+        and it then advances that attempt, never whichever one is current."""
         if getattr(self, "_closing", False):
             return
+        if not _cast_request_has_authority_for(self, request, "loaded"):
+            return
+        if request.attempt_id is not None:
+            self._advance_playback_attempt_state(
+                request.attempt_id, PlaybackAttemptState.PLAYING,
+            )
         snapshot = self._cast_pending_snapshot or {}
         self._stop_all()
         self.cast_active = True
@@ -4238,9 +5157,32 @@ class PlayerWindow(QtWidgets.QMainWindow):
         )
         self.beat.setPlaying(False)
 
-    def _on_cast_failed(self, message):
+    def _on_cast_failed(self, message, request=None):
+        """Explicit receiver failure AND the bounded no-response case.
+
+        There is deliberately no second timer here: CastController.load()
+        ends in pychromecast's own block_until_active(timeout=10), and
+        _load_worker turns ANY exception from load() -- that timeout
+        included -- into this `failed` signal. So a receiver that never
+        answers terminates here within a bounded period, which is what
+        stops a pending Cast holding its queue claim indefinitely.
+
+        Failing the attempt releases its claim UNLESS ownership has
+        already transferred (e.g. to a local fallback), because release is
+        keyed to the attempt that still owns the token.
+
+        Astra F11: a failure for a Cast operation that is no longer current
+        (see _on_cast_loaded) is dropped before it can fail another attempt,
+        disconnect, or change local/Cast output."""
         if getattr(self, "_closing", False):
             return
+        if not _cast_request_has_authority_for(self, request, "failed"):
+            return
+        _invalidate_cast_request_for(self, "cast_failed")
+        if request.attempt_id is not None:
+            self._advance_playback_attempt_state(
+                request.attempt_id, PlaybackAttemptState.FAILED,
+            )
         snapshot = self._cast_pending_snapshot
         self.cast_controller.disconnect()
         self.cast_media_server.shutdown()
@@ -4257,12 +5199,21 @@ class PlayerWindow(QtWidgets.QMainWindow):
             self._playback_expected = True
             self._playback_intentionally_paused = False
             self._activate_track_ui(
-                index if index is not None else self.track_index_by_path.get(path),
                 path,
+                library_index=(
+                    index if index is not None else self.track_index_by_path.get(path)
+                ),
+                queue_token=getattr(
+                    getattr(self, "_current_playback_attempt", None),
+                    "queue_entry_id", None,
+                ),
             )
             self.cast_media_server.revoke_all()
             media_url = self.cast_media_server.register_audio(path)
             content_type = AUDIO_TYPES[os.path.splitext(path)[1].casefold()]
+            # This track's Cast operation, bound to the attempt that
+            # _play_path_direct just started for it (Astra F11).
+            _begin_cast_request_for(self, "track")
             self._request_cast_load(media_url, content_type, path, 0.0, True)
             self._cast_completion_armed = False
             self.pending_next = False
@@ -4273,6 +5224,9 @@ class PlayerWindow(QtWidgets.QMainWindow):
             return False
 
     def _return_to_local_output(self):
+        # Astra F11: nothing still in flight from the Cast session being left
+        # may act afterwards (e.g. take the output back from local playback).
+        _invalidate_cast_request_for(self, "return_to_local_output")
         snapshot = self.cast_controller.snapshot()
         path = self.current_path
         was_playing = snapshot.get("state") == "playing"
@@ -4286,7 +5240,15 @@ class PlayerWindow(QtWidgets.QMainWindow):
         self.slider_volume.blockSignals(True)
         self.slider_volume.setValue(self.master_volume)
         self.slider_volume.blockSignals(False)
-        if path and self._play_path_direct(path, crossfade=False):
+        # Phase B: returning to local output replays the SAME logical
+        # queue entry, so the Cast attempt's token travels into the local
+        # attempt rather than being dropped. The fallback commits only
+        # when local playback itself becomes authoritative.
+        _cast_attempt = getattr(self, "_current_playback_attempt", None)
+        _cast_token = getattr(_cast_attempt, "queue_entry_id", None)
+        if path and self._play_path_direct(
+            path, crossfade=False, queue_entry_token=_cast_token,
+        ):
             position = float(snapshot.get("position", 0.0) or 0.0)
             try:
                 if self._use_builtin_player():
@@ -4299,6 +5261,16 @@ class PlayerWindow(QtWidgets.QMainWindow):
                 self.pause()
         self.statusBar().showMessage("Playing on this computer", 4000)
 
+    def _connect_cast_controller_signals(self):
+        # The request_* signals carry the CastRequest each connect/load was
+        # started for, so completions can be checked against it (Astra F11).
+        self.cast_controller.state_changed.connect(self._on_cast_state)
+        self.cast_controller.request_connected.connect(self._on_cast_connected)
+        self.cast_controller.request_loaded.connect(self._on_cast_loaded)
+        self.cast_controller.request_failed.connect(
+            lambda request, message: self._on_cast_failed(message, request)
+        )
+
     def _connect_signals(self):
         self.btn_add.clicked.connect(self.add_folder)
         self.btn_rescan.clicked.connect(self.rescan_library)
@@ -4310,10 +5282,7 @@ class PlayerWindow(QtWidgets.QMainWindow):
         self.output_combo.activated.connect(self._on_output_selected)
         self.cast_discovery.devices_changed.connect(self._on_cast_devices)
         self.cast_discovery.state_changed.connect(self._on_cast_state)
-        self.cast_controller.state_changed.connect(self._on_cast_state)
-        self.cast_controller.connected.connect(self._on_cast_connected)
-        self.cast_controller.loaded.connect(self._on_cast_loaded)
-        self.cast_controller.failed.connect(self._on_cast_failed)
+        self._connect_cast_controller_signals()
         # Music/Videos tree signal wiring (itemDoubleClicked/itemExpanded/
         # customContextMenuRequested) now happens once per tree inside
         # _build_library_tree_widget(), covering both tabs.
@@ -6684,8 +7653,21 @@ class PlayerWindow(QtWidgets.QMainWindow):
             overlay.setVisible(self._now_playing_overlay_was_visible)
             self._now_playing_overlay_suppressed = False
 
-    def _activate_track_ui(self, index: Optional[int], path: str):
-        """Make a track the visible/current song once it is actually taking over."""
+    def _activate_track_ui(
+        self, path: str, *,
+        library_index: Optional[int] = None,
+        queue_token: Optional[int] = None,
+    ):
+        """Make a track the visible/current song once it is actually taking over.
+
+        Phase D: both identities are keyword-only and independently
+        optional, because they are not alternatives -- direct library
+        playback has a library index and no token, a queue-only file has a
+        token and no library index, and a queue-played library track has
+        both. The old single positional `index` could be either, which is
+        precisely the ambiguity this removes. queue_token always comes
+        from the PlaybackAttempt or the mixed-transition identity; it is
+        never derived from the path."""
         # As early as possible -- the caller has already set
         # _current_media_type for this track before calling here, so this
         # reflects the transition immediately rather than after everything
@@ -6695,16 +7677,17 @@ class PlayerWindow(QtWidgets.QMainWindow):
         if self.viz_logger.active and self.viz_logger._track not in (None, path):
             self.viz_logger.stop()
             self._log("Visualiser logging stopped (track changed)")
-        self.current_index = index if isinstance(index, int) and index >= 0 else None
+        self.current_library_index = (
+            library_index if isinstance(library_index, int) and library_index >= 0 else None
+        )
+        self.current_queue_token = queue_token
         self.current_path = path
         # Focused view/controller harnesses used by tests do not run the
         # heavyweight window constructor.  Keep the identity guard equally
         # safe for those legitimate partial instances.
         if not hasattr(self, "_now_playing_generation"):
             self._now_playing_generation = NowPlayingGeneration()
-        now_playing_identity = self._now_playing_generation.begin(
-            path, self.current_index
-        )
+        now_playing_identity = self._now_playing_generation.begin(path)
         diagnostics = getattr(self, "diagnostics", None)
         if diagnostics is not None:
             diagnostics.record(
@@ -6923,6 +7906,18 @@ class PlayerWindow(QtWidgets.QMainWindow):
         previous = self._current_playback_attempt
         if previous is not None and not previous.is_terminal():
             previous.state = PlaybackAttemptState.CANCELLED
+            # Superseded: release ITS claim, keyed to its own id, so this
+            # can never touch a claim already handed to a replacement.
+            #
+            # EXCEPT when the incoming attempt inherits the very same
+            # queue entry -- a recovery/Cast-to-local/karaoke handoff.
+            # Releasing there would destroy the claim an instant before
+            # the replacement takes ownership of it, leaving the row
+            # unowned and uncommittable. In that case ownership simply
+            # moves across (the transfer below), which IS the handoff.
+            previous_token = getattr(previous, "queue_entry_id", None)
+            if previous_token is None or previous_token != queue_entry_id:
+                _release_attempt_queue_claim_for(self, previous, reason="superseded")
             self.diagnostics.record(
                 "playback", "playback_attempt_superseded",
                 details={
@@ -6932,6 +7927,13 @@ class PlayerWindow(QtWidgets.QMainWindow):
                 },
                 minimum_level="detailed",
             )
+        # Newer playback intent also revokes any outstanding Cast operation
+        # (Astra F11). A track request is bound to the attempt being
+        # superseded, but an output switch started with no live attempt has
+        # no attempt to lose; without this, its completion would still stop
+        # this new playback and take the output. A Cast track load for THIS
+        # attempt begins its own request after this returns.
+        _invalidate_cast_request_for(self, f"playback_attempt_{reason}")
         attempt = PlaybackAttempt(
             attempt_id=self._next_playback_attempt_id,
             source_identity=source_identity,
@@ -6941,6 +7943,17 @@ class PlayerWindow(QtWidgets.QMainWindow):
         )
         self._next_playback_attempt_id += 1
         self._current_playback_attempt = attempt
+        # Deliberately does NOT claim here. Queue-originated playback is
+        # claimed at its SELECTION site and transferred to this attempt by
+        # _play_path_direct (design A); claiming again here would make the
+        # claim depend on dispatch succeeding, which is the coupling this
+        # phase exists to remove. A recovery/fallback attempt inherits an
+        # already-claimed token the same way.
+        if queue_entry_id is not None:
+            _transfer_queue_entry_claim_for(
+                self, queue_entry_id, from_owner=None,
+                to_owner=attempt.attempt_id, reason=f"attempt_{reason}",
+            )
         self.diagnostics.record(
             "playback", "playback_attempt_started",
             details={
@@ -7027,6 +8040,7 @@ class PlayerWindow(QtWidgets.QMainWindow):
         if current is None or current.is_terminal():
             return
         current.state = PlaybackAttemptState.CANCELLED
+        _release_attempt_queue_claim_for(self, current, reason=f"cancelled_{reason}")
         self._current_playback_attempt = None
         self.diagnostics.record(
             "playback", "playback_attempt_cancelled",
@@ -7046,6 +8060,15 @@ class PlayerWindow(QtWidgets.QMainWindow):
         if current is None or current.attempt_id != attempt_id or current.is_terminal():
             return
         current.state = state
+        if state is PlaybackAttemptState.PLAYING:
+            # THE queue commit point: this attempt is now authoritative
+            # playback, which is the only thing that has ever justified
+            # marking its queue entry played.
+            _commit_attempt_queue_entry_for(self, current, reason="playing")
+        elif state in TERMINAL_STATES:
+            # Releases only if this attempt still OWNS the claim -- after a
+            # recovery handoff the replacement owns it and this is a no-op.
+            _release_attempt_queue_claim_for(self, current, reason=f"terminal_{state.value}")
 
     def _set_player_topology(self, active, inactive, *, reason: str) -> None:
         """Phase C1 (native audio backend ownership): the ONLY place
@@ -7061,6 +8084,20 @@ class PlayerWindow(QtWidgets.QMainWindow):
         miniaudio_inactive_player are stable physical identities -- all
         of them get reassigned as playback progresses."""
         changed = (active is not self.simple_player) or (inactive is not self.simple_inactive_player)
+        if changed:
+            # A physical player dropped from both roles here would be
+            # unreachable by _stop_all() from now on (e.g. a recovery-
+            # backend stream still playing when normal playback repoints
+            # the roles back to the configured backend). Stop it while it
+            # is still referenced. A promotion only swaps the same two
+            # objects, so its incoming player is never touched.
+            for retiring in (self.simple_player, self.simple_inactive_player):
+                if retiring is None or retiring is active or retiring is inactive:
+                    continue
+                try:
+                    retiring.stop()
+                except Exception:
+                    pass
         self.simple_player = active
         self.simple_inactive_player = inactive
         if changed:
@@ -7079,12 +8116,26 @@ class PlayerWindow(QtWidgets.QMainWindow):
         or miniaudio_player/miniaudio_inactive_player) is currently live,
         so both stay in sync with simple_player/simple_inactive_player
         exactly as before -- now from one implementation instead of the
-        two duplicated copies this replaces."""
+        two duplicated copies this replaces.
+
+        Phase 1.1: the pair to re-label is the one that physically holds
+        the two players being rotated, matched by object identity -- never
+        the configured builtin_backend. While a temporary recovery backend
+        is live the active pair belongs to a different backend than the
+        preference names, and re-labelling by preference renamed the
+        miniaudio players as the BASS pair (leaving the real BASS players
+        unreferenced and later BASS target leases invalid)."""
         old_active, old_inactive = self.simple_player, self.simple_inactive_player
         self._set_player_topology(old_inactive, old_active, reason=reason)
-        if self.builtin_backend == "bass":
+
+        def _holds_rotated_players(first, second):
+            return (first is old_active and second is old_inactive) or (
+                first is old_inactive and second is old_active
+            )
+
+        if _holds_rotated_players(self.bass_player, self.bass_inactive_player):
             self.bass_player, self.bass_inactive_player = self.simple_player, self.simple_inactive_player
-        else:
+        elif _holds_rotated_players(self.miniaudio_player, self.miniaudio_inactive_player):
             self.miniaudio_player, self.miniaudio_inactive_player = self.simple_player, self.simple_inactive_player
 
     def _make_target_lease(self, backend_family: str, target_role: str) -> PlayerTargetLease:
@@ -7195,8 +8246,16 @@ class PlayerWindow(QtWidgets.QMainWindow):
         self._worker_registry.unregister(registry_token)
         self._maybe_resume_final_shutdown()
 
-    def _play_path_direct(self, path: str, crossfade: bool = False, index: Optional[int] = None, immediate_crossfade: bool = False, identity_path: Optional[str] = None, media_type_override: Optional[MediaType] = None) -> bool:
-        """Play a real file path, including Up Next entries that are not in the library index."""
+    def _play_path_direct(self, path: str, crossfade: bool = False, index: Optional[int] = None, immediate_crossfade: bool = False, identity_path: Optional[str] = None, media_type_override: Optional[MediaType] = None, queue_entry_token: Optional[int] = None, queue_selection_owner: Optional[object] = None) -> bool:
+        """Play a real file path, including Up Next entries that are not in the library index.
+
+        Phase B: `queue_entry_token` is the stable identity of the QUEUE
+        ENTRY this request came from, or None for library/fallback-driven
+        playback that has no originating queue selection. It is claimed
+        here and committed only when the resulting attempt reaches
+        PLAYING -- returning True from this function means "dispatch
+        succeeded", which for every asynchronous path is emphatically not
+        the same as "the track is playing"."""
         if not path:
             return False
         # Playback stability hardening, Phase A: every direct play
@@ -7207,9 +8266,49 @@ class PlayerWindow(QtWidgets.QMainWindow):
         # true: the mere act of calling this again, for anything,
         # immediately cancels whatever attempt was previously
         # authoritative (see _begin_playback_attempt).
-        self._begin_playback_attempt(
+        attempt = self._begin_playback_attempt(
             path, media_type_override or classify_path(path), "play_path_direct",
+            queue_entry_id=queue_entry_token,
         )
+        dispatch_attempt_id = attempt.attempt_id
+        # Ownership transfer: the selection owned this claim until now.
+        # From here only the attempt lifecycle may release or commit it,
+        # so a stale selection cleanup can no longer touch it.
+        if queue_entry_token is not None and queue_selection_owner is not None:
+            _transfer_queue_entry_claim_for(
+                self, queue_entry_token,
+                from_owner=queue_selection_owner, to_owner=dispatch_attempt_id,
+                reason="selection_to_attempt",
+            )
+
+        def _dispatch_result(started, terminal_reason="dispatch_failed"):
+            # Astra F3: from here on this attempt may own the queue claim, so
+            # a dispatch that fails without starting playback must terminate
+            # it -- FAILED releases the claim it owns. Left non-terminal, it
+            # kept the reservation and no caller could release it any more.
+            # A no-op when a sub-dispatcher already terminated this attempt
+            # or superseded it (e.g. a recovery attempt).
+            if not started:
+                current = self._current_playback_attempt
+                if (
+                    current is not None
+                    and current.attempt_id == dispatch_attempt_id
+                    and not current.is_terminal()
+                ):
+                    current.terminal_reason = terminal_reason
+                    # Unbound, like the module-level queue helpers, so the
+                    # focused harnesses that borrow _play_path_direct keep
+                    # working without also binding this.
+                    PlayerWindow._advance_playback_attempt_state(
+                        self, dispatch_attempt_id, PlaybackAttemptState.FAILED,
+                    )
+                if queue_entry_token is not None:
+                    # Automatic advancement must not redispatch this entry on
+                    # every tick (a reopened prompt, a repeated rejection);
+                    # an explicit user request still may.
+                    _automatic_retry_suppressed_tokens_for(self).add(queue_entry_token)
+            return started
+
         transition_manager = getattr(self, "_video_transition_manager", None)
         if (
             transition_manager is not None
@@ -7222,7 +8321,9 @@ class PlayerWindow(QtWidgets.QMainWindow):
         if self._mixed_transition_state != "idle":
             # Same for a v1.0.71 mixed-media transition -- a direct
             # library/queue selection (double-click, etc.) supersedes it.
-            self._cancel_mixed_media_transition("external_media_request")
+            self._cancel_mixed_media_transition(
+                "external_media_request", release_incoming_claim=True,
+            )
         if is_plex_identity(path):
             # Stage 3A: Direct Play only, dispatched BEFORE os.path.isfile/
             # Mutagen/BASS-local-file/video local-file loading ever see
@@ -7234,9 +8335,9 @@ class PlayerWindow(QtWidgets.QMainWindow):
             # string since it only ever inspects the suffix.
             plex_kind = classify_path(path)
             if plex_kind == MediaType.VIDEO and media_type_override is None:
-                return self._play_plex_video_path_direct(path, index=index)
+                return _dispatch_result(self._play_plex_video_path_direct(path, index=index))
             if plex_kind == MediaType.AUDIO:
-                return self._play_plex_audio_path_direct(path, index=index)
+                return _dispatch_result(self._play_plex_audio_path_direct(path, index=index))
             # Karaoke (or anything else Plex-flavoured) is not part of the
             # Stage 3A scope -- same safe "not yet" messaging Stage 2 used
             # for all of Plex playback, now narrowed to just this case.
@@ -7249,7 +8350,7 @@ class PlayerWindow(QtWidgets.QMainWindow):
                 details={"media_type": plex_kind.value if plex_kind else "unknown"},
                 minimum_level="basic",
             )
-            return False
+            return _dispatch_result(False, "source_unsupported")
         if not os.path.isfile(path):
             self._audio_log(
                 f"missing playlist track skipped; file={self._audio_name(path)!r}"
@@ -7265,17 +8366,17 @@ class PlayerWindow(QtWidgets.QMainWindow):
                 self.statusBar().showMessage(
                     "Missing playlist track skipped", 5000
                 )
-            return False
+            return _dispatch_result(False, "source_unavailable")
         source_type = classify_path(path)
         if source_type == MediaType.KARAOKE and media_type_override is None:
-            return self._play_karaoke_path_direct(path, index=index)
+            return _dispatch_result(self._play_karaoke_path_direct(path, index=index))
         if (
             self._current_media_type == MediaType.KARAOKE
             and media_type_override != MediaType.KARAOKE
         ):
             self._stop_karaoke_for_transition()
         if source_type == MediaType.VIDEO and media_type_override is None:
-            return self._play_video_path_direct(path, index=index)
+            return _dispatch_result(self._play_video_path_direct(path, index=index))
         # Reaching here means an audio path is about to play -- stop and
         # invalidate any current video before anything else, regardless of
         # which audio route (Cast or local) ends up handling this path.
@@ -7283,7 +8384,7 @@ class PlayerWindow(QtWidgets.QMainWindow):
         if media_type_override is not None:
             self._current_media_type = media_type_override
         if getattr(self, "cast_active", False):
-            return self._cast_play_path(path, index=index)
+            return _dispatch_result(self._cast_play_path(path, index=index))
         self._playback_generation += 1
         transition_manager = getattr(self, "_video_transition_manager", None)
         if transition_manager is not None:
@@ -7306,7 +8407,9 @@ class PlayerWindow(QtWidgets.QMainWindow):
                 return True
             crossfade = False
 
-        self._activate_track_ui(index, display_path)
+        self._activate_track_ui(
+            display_path, library_index=index, queue_token=queue_entry_token,
+        )
         if self.use_simple and self.simple_player:
             # Built-in backend: either miniaudio or BASS, selected from the Library menu.
             self._simple_fallback_active = False
@@ -7318,11 +8421,11 @@ class PlayerWindow(QtWidgets.QMainWindow):
                     self._ensure_vlc()
                     if self.active_player:
                         if not self._play_on_player(self.active_player, path, volume_scale=1.0):
-                            return self._begin_playback_recovery(
+                            return _dispatch_result(self._begin_playback_recovery(
                                 "open-failed", "vlc", path=path, position=0.0
-                            )
+                            ))
                     else:
-                        return False
+                        return _dispatch_result(False)
             else:
                 self._cancel_fade()
                 self._stop_all()
@@ -7333,31 +8436,47 @@ class PlayerWindow(QtWidgets.QMainWindow):
                         if not self.active_player or not self._play_on_player(
                             self.active_player, path, volume_scale=1.0
                         ):
-                            return False
+                            return _dispatch_result(False)
                     else:
-                        return self._begin_playback_recovery(
+                        return _dispatch_result(self._begin_playback_recovery(
                             "open-failed",
                             self._backend_label().lower(),
                             path=path,
                             position=0.0,
-                        )
+                        ))
             self.beat.setPlaying(True)
         else:
             self._ensure_vlc()
             if crossfade and self.active_player and self.active_player.is_playing():
-                self._start_crossfade_to(path)
+                if not self._start_crossfade_to(path):
+                    # Phase 6: the incoming track never started and recovery
+                    # did not take over. It must not fall through to the
+                    # commit below; the outgoing track stops, as it would for
+                    # any failed VLC load.
+                    self._cancel_fade()
+                    self._stop_all()
+                    return _dispatch_result(False)
             else:
                 self._cancel_fade()
                 # Backend switches can leave the other engine playing, so silence both before VLC starts.
                 self._stop_all()
                 if not self._play_on_player(self.active_player, path, volume_scale=1.0):
-                    return self._begin_playback_recovery(
+                    return _dispatch_result(self._begin_playback_recovery(
                         "open-failed", "vlc", path=path, position=0.0
-                    )
+                    ))
                 self.beat.setPlaying(True)
         self.pending_next = False
         self._reset_progress()
         self._arm_playback_watchdog(0.0)
+        # Synchronous local playback: by here the backend has actually
+        # loaded and started the file on the GUI thread, so this attempt
+        # IS authoritative playback -- the one branch of this function
+        # where "returned True" and "is playing" genuinely coincide. Every
+        # asynchronous branch above returned earlier, on dispatch, and
+        # reaches PLAYING from its own completion callback instead.
+        self._advance_playback_attempt_state(
+            dispatch_attempt_id, PlaybackAttemptState.PLAYING,
+        )
         return True
 
     # -- Stage 3A: Plex Direct Play (audio via BASS, video classic-only) -----
@@ -7568,6 +8687,21 @@ class PlayerWindow(QtWidgets.QMainWindow):
         if not result.get("success"):
             self._fail_plex_playback_resolve(result, attempt_id)
             return
+        attempt = self._current_playback_attempt
+        if (
+            getattr(attempt, "automatic_reason", None)
+            and _automatic_progression_suspended_for(self)
+        ):
+            # Astra F2: automatic advancement resolved while paused. Starting
+            # it would stop the paused track and clear the Pause; hold the
+            # result instead and continue on Resume.
+            self._held_automatic_plex_resolve = (result, attempt_id)
+            self.diagnostics.record(
+                "plex", "plex_automatic_start_held_while_paused",
+                details={"attempt_id": attempt_id, "reason": attempt.automatic_reason},
+                minimum_level="detailed",
+            )
+            return
         source = result.get("transport_source")
         self._advance_playback_attempt_state(attempt_id, PlaybackAttemptState.STARTING)
         if media_kind == "video":
@@ -7642,7 +8776,9 @@ class PlayerWindow(QtWidgets.QMainWindow):
             index = self.track_index_by_path.get(source.identity)
         self._cancel_fade()
         self._stop_all()
-        self._activate_track_ui(index, source.identity)
+        self._activate_track_ui(
+            source.identity, library_index=index, queue_token=getattr(getattr(self, "_current_playback_attempt", None), "queue_entry_id", None),
+        )
         self._simple_fallback_active = False
         self._plex_audio_load_token += 1
         token = self._plex_audio_load_token
@@ -7812,12 +8948,11 @@ class PlayerWindow(QtWidgets.QMainWindow):
         self, source: PlexTransportSource, index: Optional[int],
         attempt_id: Optional[int] = None,
     ):
-        # Playback stability hardening, Phase A: the attempt is accepted
-        # and advanced here (the subprocess IPC load call itself is
-        # fire-and-forget, with its own generation/token handled by
-        # VideoBackend -- wiring attempt authority into that subprocess
-        # boundary is Phase C/D territory, not this round's scope).
-        self._advance_playback_attempt_state(attempt_id, PlaybackAttemptState.PLAYING)
+        # Phase 7: the attempt is NOT advanced here. Asking the subprocess to
+        # load is not playing it, and committing at dispatch marked an Up Next
+        # entry played even when the video never started. _on_video_started --
+        # the subprocess reporting it is genuinely playing -- advances it to
+        # PLAYING and commits the entry, exactly as a local video does.
         record_bass_device_state = getattr(self, "_record_bass_device_state_once", None)
         if record_bass_device_state is not None:
             record_bass_device_state()
@@ -7843,7 +8978,9 @@ class PlayerWindow(QtWidgets.QMainWindow):
         self._video_timing_available_reported = False
         if index is None:
             index = self.track_index_by_path.get(source.identity)
-        self._activate_track_ui(index, source.identity)
+        self._activate_track_ui(
+            source.identity, library_index=index, queue_token=getattr(getattr(self, "_current_playback_attempt", None), "queue_entry_id", None),
+        )
         self._show_video_loading_page()
         self.diagnostics.record(
             "playback", "video_load_started",
@@ -7883,6 +9020,7 @@ class PlayerWindow(QtWidgets.QMainWindow):
         a video becomes current while Cast output is active. Unlike
         _return_to_local_output, this never resumes playback locally: a
         video is about to start immediately after this returns."""
+        _invalidate_cast_request_for(self, "force_local_output_for_video")
         self._cast_completion_armed = False
         try:
             self.cast_controller.stop()
@@ -8012,7 +9150,9 @@ class PlayerWindow(QtWidgets.QMainWindow):
         self._video_timing_available_reported = False
         if index is None:
             index = self.track_index_by_path.get(path)
-        self._activate_track_ui(index, path)
+        self._activate_track_ui(
+            path, library_index=index, queue_token=getattr(getattr(self, "_current_playback_attempt", None), "queue_entry_id", None),
+        )
         self._show_video_loading_page()
         self.diagnostics.record(
             "playback", "video_load_started",
@@ -8106,7 +9246,9 @@ class PlayerWindow(QtWidgets.QMainWindow):
         self.karaoke_widget.clear()
         self.right_display_stack.setCurrentWidget(self._karaoke_output_page)
         self._refresh_visualiser_lifecycle("karaoke_shown")
-        self._activate_track_ui(index, source_path)
+        self._activate_track_ui(
+            source_path, library_index=index, queue_token=getattr(getattr(self, "_current_playback_attempt", None), "queue_entry_id", None),
+        )
         self.diagnostics.record(
             "playback", "karaoke_prepare_started",
             details=self.diagnostics.path_details(source_path),
@@ -8176,10 +9318,18 @@ class PlayerWindow(QtWidgets.QMainWindow):
                 },
                 minimum_level="basic",
             )
+        # Phase B: this inner dispatch supersedes the karaoke prepare
+        # attempt, so the queue token must travel with it -- it is still
+        # the SAME selected queue entry. Without this the prepare
+        # attempt's claim would be released by its own supersession and
+        # the row would never be committed. The replacement reaches
+        # PLAYING through the ordinary synchronous local-audio path.
+        _karaoke_attempt = getattr(self, "_current_playback_attempt", None)
         started = self._play_path_direct(
             pair.audio_path, crossfade=False,
             index=self.track_index_by_path.get(source_path),
             identity_path=source_path, media_type_override=MediaType.KARAOKE,
+            queue_entry_token=getattr(_karaoke_attempt, "queue_entry_id", None),
         )
         if started:
             if self.waveform_seekbar is not None:
@@ -8387,12 +9537,13 @@ class PlayerWindow(QtWidgets.QMainWindow):
         self._mixed_transition_direction = None
         self._mixed_transition_outgoing_path = None
         self._mixed_transition_incoming_path = None
-        self._mixed_transition_incoming_row = None
+        self._mixed_transition_incoming_token = None
         self._mixed_transition_reason = None
         self._mixed_transition_start = None
         self._mixed_transition_video_audio_scale = 0.0
         self._mixed_transition_gain_token = None
         self._mixed_transition_requested_monotonic = None
+        self._mixed_transition_deferred_activation = None
 
     def _mixed_media_transition_eligible(self, next_path: str) -> Optional[str]:
         """Return "audio_to_video" / "video_to_audio" if the switch from
@@ -8520,12 +9671,17 @@ class PlayerWindow(QtWidgets.QMainWindow):
             # off entirely rather than contest it; ordinary video-video
             # completion runs its course untouched.
             return False
+        if reason == "manual-next" and _automatic_progression_suspended_for(self):
+            # An explicit Next while paused plays the next item, as the
+            # direct path does (_play_path_direct clears this too); it is not
+            # a transition to hold for Resume (Astra F2).
+            self._playback_intentionally_paused = False
         transition_id = self._next_mixed_transition_id()
         self._mixed_transition_state = "preparing"
         self._mixed_transition_direction = direction
         self._mixed_transition_outgoing_path = self.current_path
         self._mixed_transition_incoming_path = next_path
-        self._mixed_transition_incoming_row = next_row
+        self._mixed_transition_incoming_token = _queue_token_for_row_of(self, next_row)
         self._mixed_transition_reason = reason
         # Long audio->video gap investigation: anchor for the new
         # incoming_video_*/audio_fade_out_started/video_play_requested/
@@ -8568,7 +9724,27 @@ class PlayerWindow(QtWidgets.QMainWindow):
             # and_fallback), so the row genuinely does get played either
             # way. Video->Audio is the mirror image -- see
             # _activate_mixed_media_transition for why it marks later.
-            self._mark_queue_row_played(next_row)
+            #
+            # Phase B: CLAIM, not commit. The old optimistic mark existed
+            # so Manual Next would skip PAST a still-preparing target
+            # rather than re-selecting it -- a claimed row is skipped by
+            # _next_unplayed_queue_row, which preserves exactly that
+            # behaviour without marking anything played or relocating the
+            # row while preparation is still in flight. It commits when
+            # the video becomes authoritative, or via the hard-cut
+            # fallback that plays this same path, and is released if the
+            # attempt dies without playing it.
+            # The mixed transition owns this claim under its OWN identity,
+            # not a PlaybackAttempt's: _begin_mixed_media_transition runs
+            # from _next_track, where the current attempt (if any) belongs
+            # to the OUTGOING track, and the transition does not create an
+            # attempt of its own. A namespaced tuple owner cannot collide
+            # with the integer attempt ids used everywhere else.
+            _claim_queue_entry_token_for(
+                self, self._mixed_transition_incoming_token,
+                attempt_id=_mixed_transition_claim_owner(transition_id),
+                reason="mixed_transition_audio_to_video",
+            )
         self.diagnostics.record(
             "playback", "mixed_transition_requested",
             details={
@@ -8732,6 +9908,12 @@ class PlayerWindow(QtWidgets.QMainWindow):
             if not player.commit_prepared(candidate):
                 return
             player.set_volume(0.0)
+            if _automatic_progression_suspended_for(self):
+                # Astra F2: prepared while paused -- keep it, but start it
+                # (and the overlap below) only on Resume.
+                self._mixed_transition_deferred_activation = {"lease": lease}
+                self._activate_mixed_media_transition()
+                return
             # Start the incoming stream silently right away -- exactly the
             # same "load succeeded" != "playback started" distinction
             # _on_crossfade_load_prepared's own comment documents for the
@@ -8777,17 +9959,60 @@ class PlayerWindow(QtWidgets.QMainWindow):
     def _activate_mixed_media_transition(self) -> None:
         if self._mixed_transition_state != "preparing":
             return
+        if _automatic_progression_suspended_for(self):
+            # Astra F2: readiness that arrives while paused is held, not
+            # acted on -- no media switch, no queue commit, no fade. Resume
+            # activates it once (_resume_deferred_mixed_activation_for).
+            if getattr(self, "_mixed_transition_deferred_activation", None) is None:
+                self._mixed_transition_deferred_activation = {"lease": None}
+            self.diagnostics.record(
+                "playback", "mixed_transition_activation_held_while_paused",
+                details={"transition_id": self._mixed_transition_id},
+                minimum_level="detailed",
+            )
+            return
+        # Phase D content guard. The token identifies the queue entry this
+        # transition was started for; that the token still EXISTS does not
+        # prove the entry still holds the media that was prepared, because
+        # missing-track repair deliberately keeps a row's token while
+        # replacing its path. Prepared A must not activate for an entry
+        # that now holds B.
+        #
+        # An unrelated insert/reorder moves the row but not the content, so
+        # it passes -- identity is never located by path, only validated by
+        # it.
+        token = self._mixed_transition_incoming_token
+        if token is not None and not _queue_entry_still_holds_source(
+            self, token, self._mixed_transition_incoming_path
+        ):
+            self.diagnostics.record(
+                "playback", "mixed_transition_source_changed",
+                details={
+                    "transition_id": self._mixed_transition_id,
+                    "direction": self._mixed_transition_direction,
+                    "expected": self._mixed_transition_incoming_path,
+                },
+                severity="warning", minimum_level="basic",
+            )
+            self._abandon_mixed_media_transition_and_fallback("incoming_source_changed")
+            return
         self._mixed_transition_state = "active"
         self._mixed_transition_start = time.time()
         direction = self._mixed_transition_direction
         if direction == "audio_to_video":
             incoming_path = self._mixed_transition_incoming_path
-            incoming_row = self._mixed_transition_incoming_row
             self._current_media_type = MediaType.VIDEO
             self._playback_generation += 1
             self._video_backend.set_muted(self._muted)
             self._video_backend.set_volume(0)
-            self._activate_track_ui(incoming_row, incoming_path)
+            # Phase D defect fix: this used to pass `incoming_row` -- a
+            # QUEUE ROW -- as the positional index, which landed in
+            # current_index and was later read as a library index.
+            self._activate_track_ui(
+                incoming_path,
+                library_index=self.track_index_by_path.get(incoming_path),
+                queue_token=self._mixed_transition_incoming_token,
+            )
             self._show_video_output_page()
             self._record_mixed_transition_gap_checkpoint("incoming_video_visible")
             transition_manager = getattr(self, "_video_transition_manager", None)
@@ -8804,6 +10029,15 @@ class PlayerWindow(QtWidgets.QMainWindow):
             # diagnostics alone that this is *not* delayed relative to the
             # video becoming visible above.
             self._record_mixed_transition_gap_checkpoint("audio_fade_out_started")
+            # Phase B: the incoming video is now the current track -- the
+            # claim taken at request time becomes a commit here.
+            _commit_queue_entry_token_for(
+                self, self._mixed_transition_incoming_token,
+                attempt_id=_queue_entry_claim_owner_of(
+                    self, self._mixed_transition_incoming_token
+                ),
+                reason="mixed_transition_audio_to_video",
+            )
         else:
             # Video->Audio: only mark the row played once preparation has
             # genuinely succeeded (we're here because it did) -- unlike
@@ -8812,9 +10046,39 @@ class PlayerWindow(QtWidgets.QMainWindow):
             # this path, so marking it played optimistically at dispatch
             # time would silently drop the track from the queue if
             # preparation had failed instead of reaching here.
-            row = self._mixed_transition_incoming_row
-            if row is not None:
-                self._mark_queue_row_played(row)
+            token = self._mixed_transition_incoming_token
+            if token is not None:
+                # _mark_queue_row_played RELOCATES this row to the bottom
+                # of the queue, so the captured number is stale the
+                # instant it returns. _finish_mixed_transition_video_to_
+                # audio still needs it (it passes it to _activate_track_
+                # ui as current_index) and used to read the pre-relocation
+                # value, pointing current_index at whatever track had
+                # shuffled up into that position instead of the track
+                # actually being promoted. Re-pin to the post-move row
+                # here so the one consumer downstream cannot see a stale
+                # one. Routed through the shared commit helper so there is
+                # a single implementation; the conservative Video->Audio
+                # TIMING is unchanged -- it still commits only once
+                # preparation has genuinely succeeded.
+                # Phase D: no row is captured or re-pinned. The commit
+                # resolves the token to its current row itself, and
+                # _finish_mixed_transition_video_to_audio resolves again
+                # at its own point of use, so no row number is ever in
+                # flight across the relocation the commit performs.
+                _commit_queue_entry_token_for(
+                    self, token,
+                    attempt_id=_queue_entry_claim_owner_of(self, token),
+                    reason="mixed_transition_video_to_audio",
+                )
+        # Astra F4: the incoming entry is committed; entries this transition
+        # skipped past (reservations taken over from the transitions it
+        # replaced) are released now that a successor is authoritative --
+        # unplayed, in place, selectable again.
+        _release_queue_claims_owned_by_for(
+            self, _mixed_transition_claim_owner(self._mixed_transition_id),
+            reason="mixed_transition_activated",
+        )
         self.diagnostics.record(
             "playback", "mixed_transition_started",
             details={
@@ -8897,7 +10161,6 @@ class PlayerWindow(QtWidgets.QMainWindow):
 
     def _finish_mixed_transition_video_to_audio(self) -> None:
         transition_id = self._mixed_transition_id
-        row = self._mixed_transition_incoming_row
         promoted_path = self._mixed_transition_incoming_path
         self._promote_inactive_player(reason="mixed_transition_video_to_audio")
         self._promote_inactive_gain_slot(promoted_path)
@@ -8931,7 +10194,12 @@ class PlayerWindow(QtWidgets.QMainWindow):
         # this and guarantees the two can never drift apart again.
         self._stop_video_for_audio_transition()
         self._playback_generation += 1
-        self._activate_track_ui(row, promoted_path)
+        # Phase D defect fix: `row` here is a QUEUE ROW, not a library index.
+        self._activate_track_ui(
+            promoted_path,
+            library_index=self.track_index_by_path.get(promoted_path),
+            queue_token=self._mixed_transition_incoming_token,
+        )
         self._reset_progress()
         try:
             promoted_position = float(self.simple_player.get_pos() or 0.0)
@@ -8957,10 +10225,54 @@ class PlayerWindow(QtWidgets.QMainWindow):
         transition_id = self._mixed_transition_id
         direction = self._mixed_transition_direction
         next_path = self._mixed_transition_incoming_path
+        # Phase B: the hard-cut fallback below plays the SAME requested
+        # path, so the claim taken at request time is handed to that
+        # attempt rather than dropped -- it commits only when the fallback
+        # itself becomes authoritative playback. Captured before
+        # _reset_mixed_media_transition_state clears it.
+        fallback_token = self._mixed_transition_incoming_token
+        claim_owner = _mixed_transition_claim_owner(transition_id)
+        # Astra F5: the fallback may only replay a target that is still what
+        # the queue holds. An authority/content invalidation (the activation
+        # guard's "incoming_source_changed") never falls back, and neither
+        # does any other failure whose token has since left the queue, been
+        # cleared, or had its source replaced -- replaying the captured path
+        # would play media the queue no longer contains.
+        target_invalidated = reason in _MIXED_TRANSITION_INVALIDATION_REASONS or (
+            fallback_token is not None
+            and not _queue_entry_still_holds_source(self, fallback_token, next_path)
+        )
+        fall_back = direction == "audio_to_video" and not target_invalidated
+        if (
+            fall_back
+            and self._mixed_transition_reason != "manual-next"
+            and _automatic_progression_suspended_for(self)
+        ):
+            # Astra F2: the hard-cut fallback is still automatic advancement.
+            # Hold it -- the transition, and its reservation, stay as they
+            # are -- and abandon on Resume, when the target is re-validated.
+            # Stop, Next or a selection cancels the transition and this.
+            self._mixed_transition_deferred_activation = {"fallback_reason": reason}
+            self.diagnostics.record(
+                "playback", "mixed_transition_fallback_held_while_paused",
+                details={"transition_id": transition_id, "fallback_reason": reason},
+                minimum_level="detailed",
+            )
+            return
         self.diagnostics.record(
             "playback", "mixed_transition_failed",
-            details={"transition_id": transition_id, "direction": direction, "fallback_reason": reason},
+            details={
+                "transition_id": transition_id, "direction": direction,
+                "fallback_reason": reason, "target_invalidated": target_invalidated,
+            },
             minimum_level="basic",
+        )
+        # Terminal cleanup for this transition's reservations: everything it
+        # owns is released, except the target's own claim when the hard-cut
+        # fallback below takes it over.
+        _release_queue_claims_owned_by_for(
+            self, claim_owner, reason="mixed_transition_abandoned",
+            keep=fallback_token if fall_back else None,
         )
         self._reset_mixed_media_transition_state()
         self.pending_next = False
@@ -8969,17 +10281,57 @@ class PlayerWindow(QtWidgets.QMainWindow):
                 self._video_backend.stop()
             except Exception:
                 pass
-            self._play_path_direct(next_path, crossfade=False, immediate_crossfade=True)
+            if fall_back:
+                self._play_path_direct(
+                    next_path, crossfade=False, immediate_crossfade=True,
+                    queue_entry_token=fallback_token,
+                )
+        elif target_invalidated and self.simple_inactive_player:
+            # The prepared incoming audio was already started silently
+            # (_on_mixed_transition_audio_load_prepared) before activation
+            # rejected it; it must not be left running.
+            try:
+                self.simple_inactive_player.stop()
+            except Exception:
+                pass
+            self._inactive_normalisation_gain = 1.0
+            self._inactive_gain_token = self._next_gain_token()
         # video_to_audio: nothing else to do -- the video was never
         # touched, so it keeps playing normally and its own natural-end/
         # manual-next path will retry (or fall back to today's hard cut).
 
-    def _cancel_mixed_media_transition(self, reason: str) -> None:
+    def _cancel_mixed_media_transition(
+        self, reason: str, *, release_incoming_claim: bool = False,
+        exit_video_fullscreen: bool = False,
+    ) -> List[int]:
+        """Returns the queue tokens this transition still reserves after the
+        cancel (Astra F4) -- empty when release_incoming_claim released them.
+
+        release_incoming_claim: release every reservation this transition
+        owns -- its own Audio->Video target claim if it never became active
+        (an active one has already committed it) and any it took over from a
+        transition it replaced. Stop, direct selection and Previous pass it:
+        nothing replaces the abandoned target, so its row must stay
+        selectable. Manual Next and _next_track do not: they keep the
+        reservations through their own selection, so they move PAST the
+        abandoned target, then resolve them with
+        _hand_off_abandoned_mixed_claims_for -- a reservation never outlives
+        its owner.
+
+        exit_video_fullscreen: also leave a video fullscreen presented by an
+        ACTIVE Audio->Video transition. Stop passes it because nothing
+        presents video afterwards."""
         if self._mixed_transition_state == "idle":
-            return
+            return []
         transition_id = self._mixed_transition_id
         direction = self._mixed_transition_direction
         was_active = self._mixed_transition_state == "active"
+        claim_owner = _mixed_transition_claim_owner(transition_id)
+        if release_incoming_claim:
+            _release_queue_claims_owned_by_for(
+                self, claim_owner, reason=f"mixed_transition_cancelled_{reason}",
+            )
+        retained_tokens = _queue_claims_owned_by_for(self, claim_owner)
         self.diagnostics.record(
             "playback", "mixed_transition_cancelled",
             details={
@@ -8990,6 +10342,21 @@ class PlayerWindow(QtWidgets.QMainWindow):
         )
         closing = getattr(self, "_closing", False)
         if direction == "audio_to_video":
+            if (
+                exit_video_fullscreen and was_active and not closing
+                and getattr(self, "_video_fullscreen", False)
+            ):
+                # An active Audio->Video transition owns the video
+                # presentation, including a fullscreen the user entered
+                # during the overlap. This branch returns the media type to
+                # AUDIO below, so the caller's own video teardown can no
+                # longer recognise that presentation -- leave fullscreen
+                # here, before the stream stops, matching
+                # _stop_video_for_audio_transition's ordering.
+                try:
+                    self._exit_video_fullscreen()
+                except Exception:
+                    pass
             try:
                 self._video_backend.stop()
             except Exception:
@@ -9011,6 +10378,7 @@ class PlayerWindow(QtWidgets.QMainWindow):
             self._inactive_gain_token = self._next_gain_token()
         self._reset_mixed_media_transition_state()
         self.pending_next = False
+        return retained_tokens
 
     def _maybe_prepare_mixed_transition_from_video(self) -> None:
         """The Video->Audio equivalent of _tick()'s audio-side near-end
@@ -9029,6 +10397,8 @@ class PlayerWindow(QtWidgets.QMainWindow):
             return
         if self.pending_next or self.fade_active or self.prebuffer_active:
             return
+        if _automatic_progression_suspended_for(self):
+            return  # Astra F2: re-evaluated on the first tick after Resume
         next_type = self._peek_next_media_type_for_transition()
         if next_type != MediaType.AUDIO:
             return
@@ -9220,20 +10590,23 @@ class PlayerWindow(QtWidgets.QMainWindow):
         if next_queue_row is None or not (0 <= next_queue_row < len(self.queue)):
             return None
         path = self.queue[next_queue_row]
+        # Phase D: the token and the source are captured together, from the
+        # same row, at the same instant -- and the ROW ITSELF is not kept.
+        # The token survives reorders; the source is only ever used later
+        # to validate that this entry still holds what was prepared.
         return SecondaryIdentity(
-            epoch=self._queue_mutation_epoch,
-            row=next_queue_row,
-            path=path,
+            queue_token=_queue_token_for_row_of(self, next_queue_row),
+            expected_source=path,
             media_type=classify_path(path),
         )
 
     def _peek_next_queue_identity_for_dual_transition(self) -> Optional[SecondaryIdentity]:
         """Like _peek_next_media_type_for_transition, but also captures the
-        stable-enough identity (epoch + row + path) a Phase 2A preload needs
+        identity (queue token + expected source) a Phase 2A preload needs
         to detect a stale target later. Deliberately queue-only -- the
         library fallback wraparound path (used once Up Next is empty) has
-        no row concept the epoch counter tracks, so dual preload/commit
-        simply never triggers in that case and Phase 1 remains available.
+        no queue entry to tokenise, so dual preload/commit simply never
+        triggers in that case and Phase 1 remains available.
 
         This is DualVideoTransitionEngine's primary identity_provider, used
         only at the genuine lead-window preload trigger in
@@ -9245,7 +10618,7 @@ class PlayerWindow(QtWidgets.QMainWindow):
             return None
         analyze_intro = getattr(self, "_maybe_analyze_video_intro", None)
         if analyze_intro is not None:
-            analyze_intro(identity.path)
+            analyze_intro(identity.expected_source)
         return identity
 
     def _maybe_analyze_video_outro(self, path: str) -> None:
@@ -9472,7 +10845,9 @@ class PlayerWindow(QtWidgets.QMainWindow):
         self._video_timing_available_reported = False
         if index is None:
             index = self.track_index_by_path.get(path)
-        self._activate_track_ui(index, path)
+        self._activate_track_ui(
+            path, library_index=index, queue_token=getattr(getattr(self, "_current_playback_attempt", None), "queue_entry_id", None),
+        )
         self.diagnostics.record(
             "playback", "video_dual_transition_promoted",
             details={
@@ -9516,6 +10891,14 @@ class PlayerWindow(QtWidgets.QMainWindow):
             # the ordinary direct-video-activation path below.
             self._on_mixed_transition_video_ready()
             return
+        # Phase B: the video subprocess has genuinely started playing --
+        # NOT the earlier point where a load/launch was merely requested.
+        # This is the authoritative moment for an ordinary video track.
+        current_attempt = getattr(self, "_current_playback_attempt", None)
+        if current_attempt is not None and not current_attempt.is_terminal():
+            self._advance_playback_attempt_state(
+                current_attempt.attempt_id, PlaybackAttemptState.PLAYING,
+            )
         self._show_video_output_page()
         self.scrubbing = False
         self._attach_video_to_party_mode()
@@ -9557,6 +10940,15 @@ class PlayerWindow(QtWidgets.QMainWindow):
                 "playback", "mixed_transition_video_eof_suppressed",
                 details={"transition_id": self._mixed_transition_id},
                 minimum_level="detailed",
+            )
+            return
+        if _automatic_progression_suspended_for(self):
+            # Astra F2: an end delivered while paused (reached just as Pause
+            # was pressed) is not reported again, so it is held and handled
+            # on Resume -- unless something else has started by then.
+            self._paused_video_end_generation = self._playback_generation
+            self.diagnostics.record(
+                "playback", "video_end_held_while_paused", minimum_level="detailed",
             )
             return
         self.diagnostics.record(
@@ -10682,6 +12074,25 @@ class PlayerWindow(QtWidgets.QMainWindow):
             _, position, _, _ = self._playback_health_snapshot()
         position = max(0.0, float(position or 0.0))
         resume_position = recovery_resume_position(position)
+        # Phase B identity handoff. Recovery replays the SAME logical queue
+        # selection on another backend, so the replacement attempt is
+        # started carrying the failing attempt's queue token and takes
+        # ownership of its claim. The original may then terminate (FAILED
+        # or CANCELLED) entirely normally: its cleanup is keyed to its own
+        # attempt id, finds it no longer owns the claim, and releases
+        # nothing. This is an ownership transfer, not an exception to
+        # FAILED semantics.
+        #
+        # Reached only AFTER every "cannot start recovery" return above,
+        # so when recovery genuinely cannot start there is no replacement
+        # owner and the original failure releases the claim as usual.
+        failing_attempt = self._current_playback_attempt
+        inherited_token = getattr(failing_attempt, "queue_entry_id", None)
+        recovery_attempt = self._begin_playback_attempt(
+            identity_path, self._current_media_type, f"recovery_{reason}",
+            queue_entry_id=inherited_token,
+        )
+        recovery_attempt_id = recovery_attempt.attempt_id
         self._playback_recovery_active = True
         recovery_started = time.perf_counter()
         self._record_playback_backend_failure(backend)
@@ -10750,9 +12161,20 @@ class PlayerWindow(QtWidgets.QMainWindow):
                     f"to_backend={attempt_backend}; position={resume_position:.2f}; "
                     f"duration_ms={(time.perf_counter() - recovery_started) * 1000.0:.1f}"
                 )
+                # Authoritative: the replacement backend has loaded and is
+                # playing. Commits the inherited token exactly once.
+                self._advance_playback_attempt_state(
+                    recovery_attempt_id, PlaybackAttemptState.PLAYING,
+                )
                 return True
             self._record_playback_backend_failure(attempt_backend)
         self._playback_recovery_active = False
+        # Every backend failed: the recovery attempt owns the inherited
+        # claim, so terminating it here is what releases the queue entry.
+        # The row stays unplayed and in its original queue position.
+        self._advance_playback_attempt_state(
+            recovery_attempt_id, PlaybackAttemptState.FAILED,
+        )
         self._cancel_playback_watchdog()
         self._stop_all()
         self.beat.setPlaying(False)
@@ -11014,8 +12436,33 @@ class PlayerWindow(QtWidgets.QMainWindow):
         self.pending_builtin_crossfade_index = None
         self.pending_builtin_crossfade_path = None
         self.pending_builtin_crossfade_quiet = False
+        if failed_path and (
+            not getattr(self, "auto_playback_recovery", True)
+            or getattr(self, "_playback_recovery_active", False)
+            or getattr(self, "_closing", False)
+        ):
+            # Phase 6: recovery cannot take this over, so the incoming track
+            # never becomes current -- the outgoing track, still playing,
+            # stays current -- and automatic advancement passes over the
+            # failed entry instead of choosing it again on the next near-end
+            # tick. The caller fails the attempt, releasing its reservation;
+            # an explicit Next or selection may still retry it.
+            token = getattr(getattr(self, "_current_playback_attempt", None), "queue_entry_id", None)
+            if token is not None:
+                _automatic_retry_suppressed_tokens_for(self).add(token)
+            try:
+                self.statusBar().showMessage(f"Couldn't play {self._audio_name(failed_path)}", 6000)
+            except Exception:
+                pass
+            return
         if failed_path:
-            self._activate_track_ui(failed_index, failed_path)
+            self._activate_track_ui(
+                failed_path, library_index=failed_index,
+                queue_token=getattr(
+                    getattr(self, "_current_playback_attempt", None),
+                    "queue_entry_id", None,
+                ),
+            )
             self._begin_playback_recovery(
                 "crossfade-failed", self._current_backend_name(),
                 error=error, path=failed_path, position=0.0,
@@ -11028,6 +12475,13 @@ class PlayerWindow(QtWidgets.QMainWindow):
             return
         if getattr(self, "_closing", False) or token != self._crossfade_load_token:
             return  # superseded by a later request; nothing to undo here
+        if _automatic_progression_suspended_for(self):
+            # Phase 6 (with Astra F2): handling the failure would run recovery
+            # -- tearing down the paused track and switching the current one
+            # -- during the Pause. Hold it; Resume replays it through this
+            # same validation, so Stop or a newer selection discards it.
+            self._held_crossfade_failure = (token, path, error, attempt_id)
+            return
         self._fail_pending_crossfade(self._backend_label().lower(), path, error)
         self._advance_playback_attempt_state(attempt_id, PlaybackAttemptState.FAILED)
 
@@ -11082,8 +12536,10 @@ class PlayerWindow(QtWidgets.QMainWindow):
             # Start the incoming stream silently right away, the same way the
             # VLC path already does via _play_on_player(volume_scale=0.0),
             # so device/buffer startup latency doesn't sit right at the
-            # crossfade boundary.
-            player.play()
+            # crossfade boundary. Not while paused (Astra F2): it would run
+            # on through the pause; _begin_builtin_fade starts it on Resume.
+            if not _automatic_progression_suspended_for(self):
+                player.play()
             stats = player.stats()
             self._audio_log(
                 f"backend={backend} crossfade start; file={self._audio_name(path)!r}; "
@@ -11091,11 +12547,16 @@ class PlayerWindow(QtWidgets.QMainWindow):
             )
         except Exception as ex:
             self._fail_pending_crossfade(backend, path, ex)
+            # Phase 6: as for a failed load -- the attempt fails, releasing its
+            # reservation (a no-op if recovery has taken it over).
+            self._advance_playback_attempt_state(attempt_id, PlaybackAttemptState.FAILED)
             return
         self.fade_waits = 0
         self.pending_next = False
         self._builtin_fade_generation += 1
         fade_generation = self._builtin_fade_generation
+        # The attempt this crossfade belongs to; its fade begin commits it.
+        self._builtin_crossfade_attempt_id = attempt_id
         crossfade_seconds = self.crossfade_seconds
         try:
             remaining = max(0.0, self.simple_player.get_length() - self.simple_player.get_pos())
@@ -11105,7 +12566,18 @@ class PlayerWindow(QtWidgets.QMainWindow):
         fade_delay_s = 0.0 if quiet_triggered else max(0.0, remaining - crossfade_seconds)
         if fade_delay_s > 0.05:
             self._audio_log(f"backend={backend} prebuffer ready; fade_starts_in={fade_delay_s:.2f}s")
-            QtCore.QTimer.singleShot(int(fade_delay_s * 1000), lambda gen=fade_generation: self._begin_builtin_fade(gen))
+            # The callback carries the identity of THIS load, fixed now, and
+            # proves it is still current before acting: the fade generation
+            # alone does not change until a later load is prepared, so a
+            # later load must never be what it finds (Astra F2).
+            # Runs from a Qt timer, where an exception aborts the process:
+            # read the token defensively.
+            def _begin_scheduled_fade(gen=fade_generation, load_token=token):
+                if load_token != getattr(self, "_crossfade_load_token", None):
+                    return
+                self._begin_builtin_fade(gen)
+
+            QtCore.QTimer.singleShot(int(fade_delay_s * 1000), _begin_scheduled_fade)
         else:
             if immediate:
                 self._audio_log(f"backend={backend} prebuffer ready; manual fade begins now")
@@ -11118,37 +12590,62 @@ class PlayerWindow(QtWidgets.QMainWindow):
             return
         if not self.prebuffer_active or self.fade_active:
             return
+        if _automatic_progression_suspended_for(self):
+            # Astra F2: held until Resume, which begins it (still guarded by
+            # this generation) instead of switching tracks while paused.
+            # Every caller has just proven this load current (the scheduled
+            # callback checks its own captured token first).
+            self._deferred_builtin_fade_generation = (
+                self._builtin_fade_generation, self._crossfade_load_token,
+            )
+            return
         # Normally already playing (started silently in
         # _start_miniaudio_crossfade_to); this is just a safety net.
         if self.simple_inactive_player and not self.simple_inactive_player.is_playing():
             try:
                 self.simple_inactive_player.play()
             except Exception as ex:
-                self._audio_log(f"backend={self._backend_label().lower()} crossfade begin failed; error={ex}")
-                failed_path = self.pending_builtin_crossfade_path
-                failed_index = self.pending_builtin_crossfade_index
-                self.prebuffer_active = False
-                self.pending_builtin_crossfade_index = None
-                self.pending_builtin_crossfade_path = None
-                self.pending_builtin_crossfade_quiet = False
-                if failed_path:
-                    self._activate_track_ui(failed_index, failed_path)
-                    self._begin_playback_recovery(
-                        "crossfade-failed",
-                        self._current_backend_name(),
-                        error=ex,
-                        path=failed_path,
-                        position=0.0,
+                # Phase 6: the same failure handling as a failed load (see
+                # _fail_pending_crossfade), then this crossfade's attempt
+                # fails -- a no-op if recovery has taken it over.
+                self._fail_pending_crossfade(
+                    self._backend_label().lower(), self.pending_builtin_crossfade_path, ex,
+                )
+                attempt_id, self._builtin_crossfade_attempt_id = (
+                    getattr(self, "_builtin_crossfade_attempt_id", None), None,
+                )
+                if attempt_id is not None:
+                    PlayerWindow._advance_playback_attempt_state(
+                        self, attempt_id, PlaybackAttemptState.FAILED,
                     )
                 return
         pending_index = self.pending_builtin_crossfade_index
         pending_path = self.pending_builtin_crossfade_path
         if pending_path:
-            self._activate_track_ui(pending_index, pending_path)
+            self._activate_track_ui(
+                pending_path, library_index=pending_index,
+                queue_token=getattr(getattr(self, "_current_playback_attempt", None), "queue_entry_id", None),
+            )
         self.fade_active = True
         self.fade_start = time.time()
         self.pending_builtin_crossfade_quiet = False
         self._audio_log(f"backend={self._backend_label().lower()} crossfade playback begin")
+        # Phase 5: the fade beginning is where the crossfaded track becomes
+        # the current, audible track, so the attempt that prepared it reaches
+        # PLAYING -- the queue commit point -- here, exactly once. It used to
+        # never get there: _play_path_direct returns from its crossfade
+        # branch on dispatch, so the entry stayed claimed and unplayed, came
+        # back unplayed when the next track superseded it, and was played
+        # again. A superseded or stopped attempt is not current and commits
+        # nothing (_advance_playback_attempt_state checks). Unbound, for the
+        # focused harnesses that borrow this method.
+        attempt_id, self._builtin_crossfade_attempt_id = (
+            getattr(self, "_builtin_crossfade_attempt_id", None), None,
+        )
+        if attempt_id is not None:
+            PlayerWindow._advance_playback_attempt_state(
+                self, attempt_id, PlaybackAttemptState.PLAYING,
+            )
         if self._use_bass_backend():
             # BASS can ramp channel volume internally, while _fade_tick also
             # applies a manual guard ramp for packaged builds where slides fail.
@@ -11216,9 +12713,16 @@ class PlayerWindow(QtWidgets.QMainWindow):
         self._arm_playback_watchdog(promoted_position)
         self._audio_log(f"backend={self._backend_label().lower()} crossfade complete")
 
-    def _start_crossfade_to(self, path: str):
+    def _start_crossfade_to(self, path: str) -> bool:
+        """True once the incoming track is playing (or recovery has taken
+        over successfully); False if it could not be started."""
         if self.prebuffer_active:
-            return
+            return True
+        # Astra F2 (Phase 4.2): the identity of this VLC crossfade. Its
+        # delayed fade begin carries it, so a timer left over from an
+        # abandoned crossfade can never begin a newer one.
+        self._vlc_crossfade_generation = getattr(self, "_vlc_crossfade_generation", 0) + 1
+        generation = self._vlc_crossfade_generation
         self.prebuffer_active = True
         self.fade_from = (1.0, 0.0)
         self.fade_waits = 0
@@ -11229,12 +12733,19 @@ class PlayerWindow(QtWidgets.QMainWindow):
             self.inactive_player, path, volume_scale=0.0
         ):
             self.prebuffer_active = False
-            self._begin_playback_recovery(
+            return self._begin_playback_recovery(
                 "crossfade-failed", "vlc", path=path, position=0.0
             )
-            return
         self.pending_next = False
-        QtCore.QTimer.singleShot(PREBUFFER_MS, self._begin_fade)
+
+        # Runs from a Qt timer, where an exception aborts the process: read
+        # the generation defensively.
+        def _begin_scheduled_vlc_fade(scheduled=generation):
+            if scheduled == getattr(self, "_vlc_crossfade_generation", None):
+                self._begin_fade()
+
+        QtCore.QTimer.singleShot(PREBUFFER_MS, _begin_scheduled_vlc_fade)
+        return True
 
     def _finish_crossfade(self):
         self.active_player.stop()
@@ -11274,22 +12785,25 @@ class PlayerWindow(QtWidgets.QMainWindow):
             players.append(self.simple_inactive_player)
         return players
 
+    @_syncs_progression_with_pause
     def pause(self):
         if self._current_media_type == MediaType.VIDEO:
             transition_manager = getattr(self, "_video_transition_manager", None)
             if self._playback_intentionally_paused:
                 self._video_backend.resume()
+                # Set first: the transition engines read this Pause
+                # authority while handling the change (Astra F2).
+                self._playback_intentionally_paused = False
                 if transition_manager is not None:
                     transition_manager.playback_paused(False)
-                self._playback_intentionally_paused = False
                 self.btn_pause.setText("Pause")
                 self.btn_pause.setAccessibleName("Pause")
                 self._announce_accessible_status("Playback started")
             else:
                 self._video_backend.pause()
+                self._playback_intentionally_paused = True
                 if transition_manager is not None:
                     transition_manager.playback_paused(True)
-                self._playback_intentionally_paused = True
                 self.btn_pause.setText("Resume")
                 self.btn_pause.setAccessibleName("Resume")
                 self._announce_accessible_status("Playback paused")
@@ -12747,42 +14261,62 @@ class PlayerWindow(QtWidgets.QMainWindow):
         # could otherwise race with the video-video transition manager
         # deciding to start its own transition on top of it.
         cancelled_video_to_audio = False
+        abandoned_owner, abandoned_tokens = None, []
         if self._mixed_transition_state != "idle":
             cancelled_video_to_audio = self._mixed_transition_direction == "video_to_audio"
-            self._cancel_mixed_media_transition("manual_next")
-        # Real-device bug (2026-09-05, user report): "press Next while a
-        # video is crossfading into a music track" silently did nothing
-        # further -- the video just kept playing. Cancelling a video_to_
-        # audio mixed transition (above) deliberately leaves
-        # _current_media_type == VIDEO (the mixed system's own comment:
-        # "the video was never touched, so it keeps playing normally"),
-        # so on its own the check below cannot tell "genuinely still on a
-        # video with no handoff in progress" apart from "was just in the
-        # middle of the mixed-media system's own video->audio handoff,
-        # which already fully owns this boundary and has just abandoned
-        # it." VideoTransitionManager.request_manual_next() -- built for
-        # video<->video Phase 1 fades, not mixed-media video<->audio --
-        # matches that exact situation too (its own supports() check
-        # only looks at current_media_type, still VIDEO here) and can
-        # claim the request without ever reaching _next_track() below --
-        # confirmed via real diagnostics: repeated mixed_transition_
-        # cancelled(direction=video_to_audio, reason=manual_next) events
-        # with nothing else ever following, i.e. next_track() kept
-        # returning early here every time.
-        transition_manager = getattr(self, "_video_transition_manager", None)
-        if (
-            not cancelled_video_to_audio
-            and transition_manager is not None
-            and transition_manager.request_manual_next(self._current_media_type)
-        ):
+            abandoned_owner = _mixed_transition_claim_owner(self._mixed_transition_id)
+            # Reservations are kept through the selection below so this Next
+            # moves past them, then handed on or released (Astra F4).
+            abandoned_tokens = self._cancel_mixed_media_transition("manual_next") or []
+        try:
+            # Real-device bug (2026-09-05, user report): "press Next while a
+            # video is crossfading into a music track" silently did nothing
+            # further -- the video just kept playing. Cancelling a video_to_
+            # audio mixed transition (above) deliberately leaves
+            # _current_media_type == VIDEO (the mixed system's own comment:
+            # "the video was never touched, so it keeps playing normally"),
+            # so on its own the check below cannot tell "genuinely still on a
+            # video with no handoff in progress" apart from "was just in the
+            # middle of the mixed-media system's own video->audio handoff,
+            # which already fully owns this boundary and has just abandoned
+            # it." VideoTransitionManager.request_manual_next() -- built for
+            # video<->video Phase 1 fades, not mixed-media video<->audio --
+            # matches that exact situation too (its own supports() check
+            # only looks at current_media_type, still VIDEO here) and can
+            # claim the request without ever reaching _next_track() below --
+            # confirmed via real diagnostics: repeated mixed_transition_
+            # cancelled(direction=video_to_audio, reason=manual_next) events
+            # with nothing else ever following, i.e. next_track() kept
+            # returning early here every time.
+            transition_manager = getattr(self, "_video_transition_manager", None)
+            if (
+                not cancelled_video_to_audio
+                and transition_manager is not None
+                and transition_manager.request_manual_next(self._current_media_type)
+            ):
+                self._announce_accessible_status("Next track selected")
+                return
+            self._next_track("manual-next")
             self._announce_accessible_status("Next track selected")
-            return
-        self._next_track("manual-next")
-        self._announce_accessible_status("Next track selected")
+        finally:
+            _hand_off_abandoned_mixed_claims_for(
+                self, abandoned_owner, abandoned_tokens, reason="manual_next",
+            )
 
     def _next_track(self, reason: str):
         if self._mixed_transition_state != "idle":
-            self._cancel_mixed_media_transition(f"superseded_by_{reason}")
+            abandoned_owner = _mixed_transition_claim_owner(self._mixed_transition_id)
+            abandoned_tokens = self._cancel_mixed_media_transition(f"superseded_by_{reason}") or []
+            if abandoned_tokens:
+                # Keep them through this selection (so it moves past them),
+                # then hand on or release -- see next_track (Astra F4). The
+                # transition is idle now, so this runs the body below once.
+                try:
+                    return self._next_track(reason)
+                finally:
+                    _hand_off_abandoned_mixed_claims_for(
+                        self, abandoned_owner, abandoned_tokens, reason=f"superseded_by_{reason}",
+                    )
         if reason in ("quiet-end", "near-end", "vlc-ended", "normal-end", "video-ended"):
             self._record_track_completion(reason)
             if self.sleep_timer.is_stop_after_track:
@@ -12793,37 +14327,55 @@ class PlayerWindow(QtWidgets.QMainWindow):
         if self.fade_active or self.prebuffer_active:
             self._audio_log(f"next ignored; reason={reason}; fade_active={self.fade_active}; prebuffer_active={self.prebuffer_active}")
             return
-        skipped_missing = 0
-        next_queue_row = self._next_unplayed_queue_row()
-        while (
-            next_queue_row is not None
-            and self._queue_entry_is_missing(next_queue_row)
-        ):
-            self.queue_played[next_queue_row] = True
-            skipped_missing += 1
-            self.diagnostics.record(
-                "playlist", "missing_entry_skipped",
-                severity="warning",
-                details={
-                    "reason": reason,
-                    **self.diagnostics.path_details(
-                        self.queue[next_queue_row]
-                    ),
-                },
-                minimum_level="basic",
-            )
-            next_queue_row = self._next_unplayed_queue_row()
-        if skipped_missing:
-            self._refresh_queue_list(
-                keep_played_bottom=False, cached_details_only=True,
-                reason="missing_playlist_entries_skipped",
-            )
-            self.statusBar().showMessage(
-                f"Skipped {skipped_missing} missing playlist "
-                f"{'track' if skipped_missing == 1 else 'tracks'}",
-                5000,
-            )
-        if next_queue_row is not None:
+        automatic = reason in _AUTOMATIC_ADVANCE_REASONS
+        # Tokens whose dispatch failed during THIS request: each is tried at
+        # most once per request, automatic or explicit.
+        failed_this_request = set()
+
+        def _pick_next_row():
+            # Passed over, never claimed or marked played. Automatic
+            # advancement also passes over entries that already failed in this
+            # context; an explicit request (manual Next) retries them.
+            excluded = set(failed_this_request)
+            if automatic:
+                excluded |= _automatic_retry_suppressed_tokens_for(self)
+            if excluded:
+                return self._next_unplayed_queue_row(exclude_tokens=frozenset(excluded))
+            return self._next_unplayed_queue_row()
+
+        while True:
+            skipped_missing = 0
+            next_queue_row = _pick_next_row()
+            while (
+                next_queue_row is not None
+                and self._queue_entry_is_missing(next_queue_row)
+            ):
+                self.queue_played[next_queue_row] = True
+                skipped_missing += 1
+                self.diagnostics.record(
+                    "playlist", "missing_entry_skipped",
+                    severity="warning",
+                    details={
+                        "reason": reason,
+                        **self.diagnostics.path_details(
+                            self.queue[next_queue_row]
+                        ),
+                    },
+                    minimum_level="basic",
+                )
+                next_queue_row = _pick_next_row()
+            if skipped_missing:
+                self._refresh_queue_list(
+                    keep_played_bottom=False, cached_details_only=True,
+                    reason="missing_playlist_entries_skipped",
+                )
+                self.statusBar().showMessage(
+                    f"Skipped {skipped_missing} missing playlist "
+                    f"{'track' if skipped_missing == 1 else 'tracks'}",
+                    5000,
+                )
+            if next_queue_row is None:
+                break
             next_path = self.queue[next_queue_row]
             mixed_direction = self._mixed_media_transition_eligible(next_path)
             if mixed_direction is not None:
@@ -12838,8 +14390,46 @@ class PlayerWindow(QtWidgets.QMainWindow):
                 f"next requested; reason={reason}; queue_row={next_queue_row}; "
                 f"file={self._audio_name(next_path)!r}"
             )
-            if self._play_path_direct(next_path, crossfade=crossfade, immediate_crossfade=True):
-                self._mark_queue_row_played(next_queue_row)
+            # Phase B: NO commit here. Dispatch success is not playback
+            # success -- for every asynchronous backend this returns True
+            # the moment a worker/subprocess/network request was started.
+            # The token is claimed inside _play_path_direct and committed
+            # only when the attempt reaches PLAYING.
+            token, selection_owner = _claim_queue_selection_for(
+                self, next_queue_row, reason=reason,
+            )
+            if self._play_path_direct(
+                next_path, crossfade=crossfade, immediate_crossfade=True,
+                queue_entry_token=token, queue_selection_owner=selection_owner,
+            ):
+                if automatic:
+                    _mark_automatic_origin_for(self, next_path, reason)
+                return
+            # Only meaningful if no attempt ever took ownership (a no-op
+            # otherwise): an attempt that did has already terminated and
+            # released its own claim -- this caller never needs to.
+            _release_queue_entry_claim_for(
+                self, token, attempt_id=selection_owner,
+                reason="dispatch_failed",
+            )
+            # Nothing is in flight any more, so advancement is not pending.
+            self.pending_next = False
+            if token is None:
+                return
+            failed_this_request.add(token)
+            attempt = self._current_playback_attempt
+            if (
+                getattr(attempt, "queue_entry_id", None) == token
+                and getattr(attempt, "terminal_reason", None) == "source_unavailable"
+            ):
+                continue  # this entry's file is unavailable: try the next one
+            # Any other synchronous failure ends this request; automatic
+            # ticks then pass over this token instead of re-dispatching it.
+            return
+        if failed_this_request or (automatic and _automatic_retry_suppressed_tokens_for(self)):
+            # Every remaining candidate already failed; do not fall back to
+            # the library in its place.
+            self.pending_next = False
             return
         fallback = self._playback_fallback_paths()
         if not fallback:
@@ -12855,7 +14445,8 @@ class PlayerWindow(QtWidgets.QMainWindow):
             f"next requested; reason={reason}; library_index={next_index}; "
             f"file={self._audio_name(next_path)!r}"
         )
-        self._play_path_direct(next_path, crossfade=crossfade, immediate_crossfade=True)
+        if self._play_path_direct(next_path, crossfade=crossfade, immediate_crossfade=True) and automatic:
+            _mark_automatic_origin_for(self, next_path, reason)
 
     def _crossfade_eligible_for_transition(self, next_path: str) -> bool:
         """The user's crossfade preference only ever applies audio-to-audio.
@@ -12897,7 +14488,7 @@ class PlayerWindow(QtWidgets.QMainWindow):
 
     def prev_track(self):
         if self._mixed_transition_state != "idle":
-            self._cancel_mixed_media_transition("prev_track")
+            self._cancel_mixed_media_transition("prev_track", release_incoming_claim=True)
         if not self.queue and not self._playback_fallback_paths():
             return
         if self.fade_active or self.prebuffer_active:
@@ -12941,14 +14532,17 @@ class PlayerWindow(QtWidgets.QMainWindow):
             duration = float(snapshot.get("duration", 0.0) or 0.0)
             if duration > 0 and not self.scrubbing:
                 self._update_progress(int(position * 1000), int(duration * 1000))
+            # Astra F2: receiver state is an observation, possibly delayed;
+            # it never sets or clears the user's intentional Pause, which
+            # only pause()/Resume and explicit playback change.
             if state == "playing":
                 self._cast_completion_armed = True
-                self._playback_intentionally_paused = False
             elif state == "paused":
-                self._playback_intentionally_paused = True
+                pass
             elif is_natural_completion(
                 snapshot, self._cast_completion_armed
-            ):
+            ) and not _automatic_progression_suspended_for(self):
+                # Paused (Astra F2): stays armed, so it advances after Resume.
                 self._cast_completion_armed = False
                 self._record_track_completion("cast-ended")
                 self._next_track("cast-ended")
@@ -12993,7 +14587,17 @@ class PlayerWindow(QtWidgets.QMainWindow):
                 if self._use_bass_backend():
                     prebuffer_sec = max(prebuffer_sec, 2.0)
                 mode = "normal" if self._current_media_type == MediaType.KARAOKE else self.track_transition_mode
-                if mode == "crossfade":
+                if _automatic_progression_suspended_for(self) or not getattr(self, "_playback_expected", True):
+                    # Astra F2: a paused track keeps its position, so no end
+                    # trigger may fire -- and no quiet-end evidence (a paused
+                    # analyzer reads silence) accumulates -- until Resume,
+                    # when the same position is evaluated again.
+                    # Phase 5: nor after Stop. A stopped built-in player
+                    # rewinds to 0 but keeps reporting its length, so a short
+                    # track read as inside the crossfade/quiet-end window and
+                    # the next track started after Stop.
+                    pass
+                elif mode == "crossfade":
                     # Some mixes carry dead air after the musical fade-out. Use the
                     # analyzer's RMS reading near the end to begin the next fade when
                     # the track has audibly gone quiet, not only when the file ends.
@@ -13520,22 +15124,34 @@ class PlayerWindow(QtWidgets.QMainWindow):
         self.scan_bar.setValue(0)
         self.scan_bar.setVisible(False)
         self._close_scan_dialog()
-        if self.current_path and self.current_path in self.track_index_by_path:
-            self.current_index = self.track_index_by_path[self.current_path]
+        # Phase D: a library index is POSITIONAL and this rescan has just
+        # rebuilt self.tracks/track_index_by_path, so any previously stored
+        # number is meaningless now -- it would index a different file.
+        # Recompute it from current_path, the durable library-side
+        # identity, and drop it entirely when the current track is no
+        # longer in the library. The old code fell through to
+        # self.tracks[self.current_index] using the PRE-rescan number,
+        # which displayed an unrelated track's name (and, because
+        # _activate_track_ui used to accept a queue row as that index,
+        # could be indexing with a queue row in the first place).
+        if self.current_path:
+            self.current_library_index = self.track_index_by_path.get(self.current_path)
+        else:
+            self.current_library_index = None
+        if self.current_path and self.current_library_index is not None:
             self._select_tree_item(self.current_path)
-            # A Local rescan can complete while a Plex track is current
-            # (nothing prevents starting one mid-playback) -- consult the
-            # same shared, source-aware lookup instead of always
-            # re-deriving the label from the path alone.
-            meta = self._display_meta_for_path(self.current_path)
-            self.now_playing.setText(
-                meta.get("title") or os.path.splitext(os.path.basename(self.current_path))[0]
-            )
-        elif self.current_index is None:
+        if not self.current_path:
             self.now_playing.setText("Ready")
         else:
-            if 0 <= self.current_index < len(self.tracks):
-                self.now_playing.setText(os.path.splitext(os.path.basename(self.tracks[self.current_index]))[0])
+            # Source-aware lookup: a Local rescan can complete while a Plex
+            # track is current, and the label must still come from the
+            # track that is actually playing -- never from a positional
+            # lookup into the freshly rebuilt library list.
+            meta = self._display_meta_for_path(self.current_path)
+            self.now_playing.setText(
+                meta.get("title")
+                or os.path.splitext(os.path.basename(self.current_path))[0]
+            )
 
     def _show_scan_dialog(self, title: str):
         if self.scan_dialog is not None:
@@ -14102,7 +15718,7 @@ class PlayerWindow(QtWidgets.QMainWindow):
         self._rebuild_library_search_index()
         self._showing_full = False
         self.tracks = []
-        self.current_index = None
+        self.current_library_index = None
         self.track_index_by_path = {}
         self.tree_item_by_path = {}
         self.album_item_by_key = {}
@@ -14115,6 +15731,9 @@ class PlayerWindow(QtWidgets.QMainWindow):
         self.queue = []
         self.queue_played = []
         self.queue_playlist_entries = []
+        # Wholesale teardown, not a mutation -- controlled reinitialisation
+        # (which also drops every claim, since no entry survives).
+        self._initialise_queue_entry_tokens("library_cache_deleted")
         self._schedule_session_save()
         self.queue_detail_cache.clear()
         self.queue_analysis_pending.clear()
@@ -14233,7 +15852,8 @@ class PlayerWindow(QtWidgets.QMainWindow):
         self._save_cache(kept_folders, kept_meta)
         if self.current_path and under_folder(self.current_path):
             self.current_path = None
-            self.current_index = None
+            self.current_library_index = None
+            self.current_queue_token = None
             self._stop_all()
             self.now_playing.setText("Ready")
             try:
@@ -14318,7 +15938,8 @@ class PlayerWindow(QtWidgets.QMainWindow):
         self._save_cache(kept_folders, kept_meta)
         if self.current_path and remove_path(self.current_path):
             self.current_path = None
-            self.current_index = None
+            self.current_library_index = None
+            self.current_queue_token = None
             self._stop_all()
             self.now_playing.setText("Ready")
         QtWidgets.QMessageBox.information(self, "Remove From Library", f"Removed {label} from the library cache.")
@@ -14907,10 +16528,14 @@ class PlayerWindow(QtWidgets.QMainWindow):
             return
         self._ensure_queue_played_flags()
         with capture_queue_undo(self, "remove"):
+            _bootstrap_queue_entry_tokens(self)
             self.queue.pop(row)
             self.queue_playlist_entries.pop(row)
             if row < len(self.queue_played):
                 self.queue_played.pop(row)
+            if row < len(self._queue_entry_tokens):
+                self._queue_entry_tokens.pop(row)
+            _prune_queue_entry_claims_for(self, "remove_selected_queue_item")
             next_row = min(row, len(self.queue) - 1)
             self._remove_queue_row_widget(row, reason="track_removed")
             if next_row >= 0:
@@ -14925,9 +16550,13 @@ class PlayerWindow(QtWidgets.QMainWindow):
             return
         self._ensure_queue_played_flags()
         with capture_queue_undo(self, "reorder"):
+            _bootstrap_queue_entry_tokens(self)
             self.queue[row], self.queue[target] = self.queue[target], self.queue[row]
             self.queue_played[row], self.queue_played[target] = (
                 self.queue_played[target], self.queue_played[row]
+            )
+            self._queue_entry_tokens[row], self._queue_entry_tokens[target] = (
+                self._queue_entry_tokens[target], self._queue_entry_tokens[row]
             )
             self.queue_playlist_entries[row], self.queue_playlist_entries[target] = (
                 self.queue_playlist_entries[target], self.queue_playlist_entries[row]
@@ -14942,14 +16571,17 @@ class PlayerWindow(QtWidgets.QMainWindow):
         if not self.queue:
             return
         with capture_queue_undo(self, "shuffle"):
+            self._ensure_queue_played_flags()
             combined = list(zip(
-                self.queue, self.queue_played, self.queue_playlist_entries
+                self.queue, self.queue_played, self.queue_playlist_entries,
+                self._queue_entry_tokens,
             ))
             random.shuffle(combined)
             if combined:
-                self.queue, self.queue_played, self.queue_playlist_entries = map(
-                    list, zip(*combined)
-                )
+                (
+                    self.queue, self.queue_played, self.queue_playlist_entries,
+                    self._queue_entry_tokens,
+                ) = map(list, zip(*combined))
             self._refresh_queue_list(cached_details_only=True, reason="shuffle")
         self._schedule_session_save()
 
@@ -14957,12 +16589,19 @@ class PlayerWindow(QtWidgets.QMainWindow):
         if not (0 <= row < len(self.queue)):
             return
         with capture_queue_undo(self, "reorder"):
+            _bootstrap_queue_entry_tokens(self)
             path = self.queue.pop(row)
             played = self.queue_played.pop(row) if row < len(self.queue_played) else False
             entry = self.queue_playlist_entries.pop(row)
+            token = (
+                self._queue_entry_tokens.pop(row)
+                if row < len(self._queue_entry_tokens) else None
+            )
             self.queue.insert(0, path)
             self.queue_played.insert(0, played)
             self.queue_playlist_entries.insert(0, entry)
+            if token is not None:
+                self._queue_entry_tokens.insert(0, token)
             self._move_queue_row_widget(row, 0, reason="track_moved")
             self.queue_list.setCurrentRow(0)
         self._schedule_session_save()
@@ -14978,17 +16617,20 @@ class PlayerWindow(QtWidgets.QMainWindow):
         if confirm != QtWidgets.QMessageBox.StandardButton.Yes:
             return
         with capture_queue_undo(self, "remove_played"):
+            self._ensure_queue_played_flags()
             kept = [
                 entry for entry in zip(
                     self.queue, self.queue_played,
-                    self.queue_playlist_entries
+                    self.queue_playlist_entries, self._queue_entry_tokens,
                 ) if not entry[1]
             ]
-            self.queue = [p for p, _, _ in kept]
-            self.queue_played = [played for _, played, _ in kept]
+            self.queue = [p for p, _, _, _ in kept]
+            self.queue_played = [played for _, played, _, _ in kept]
             self.queue_playlist_entries = [
-                entry for _, _, entry in kept
+                entry for _, _, entry, _ in kept
             ]
+            self._queue_entry_tokens = [token for _, _, _, token in kept]
+            _prune_queue_entry_claims_for(self, "remove_played_queue_tracks")
             self._refresh_queue_list(cached_details_only=True, reason="played_tracks_removed")
         self._schedule_session_save()
 
@@ -14996,9 +16638,12 @@ class PlayerWindow(QtWidgets.QMainWindow):
         if not self.queue:
             return
         with capture_queue_undo(self, "clear"):
+            _bootstrap_queue_entry_tokens(self)
             self.queue.clear()
             self.queue_played.clear()
             self.queue_playlist_entries.clear()
+            self._queue_entry_tokens.clear()
+            _prune_queue_entry_claims_for(self, "clear_up_next_queue")
             self._refresh_queue_list(cached_details_only=True, reason="clear_queue")
         self._schedule_session_save()
 
@@ -15038,15 +16683,25 @@ class PlayerWindow(QtWidgets.QMainWindow):
             return
         started = time.perf_counter()
         try:
+            snapshot_tokens = list(getattr(snapshot, "queue_entry_tokens", []))
             if not (
                 len(snapshot.queue) == len(snapshot.queue_played)
                 == len(snapshot.queue_playlist_entries)
             ):
                 raise ValueError("undo snapshot lists are misaligned")
+            if snapshot_tokens and len(snapshot_tokens) != len(snapshot.queue):
+                raise ValueError("undo snapshot entry tokens are misaligned")
             self.queue = list(snapshot.queue)
             self.queue_played = list(snapshot.queue_played)
             self.queue_playlist_entries = list(snapshot.queue_playlist_entries)
+            # Restore identity rather than re-inventing it: a row that
+            # comes back from an undo is the SAME logical entry it was
+            # before, so an in-flight attempt still resolves to it and its
+            # claim survives. Claims are then pruned only for tokens the
+            # undo genuinely removed from the queue.
+            self._queue_entry_tokens = snapshot_tokens
             self._ensure_queue_played_flags()
+            _prune_queue_entry_claims_for(self, "undo_queue_change")
             # A structural mutation that can change what's at any given
             # row -- a preload/candidate selection recorded by (epoch, row,
             # path) before the undo must not be trusted to still describe
@@ -15138,6 +16793,9 @@ class PlayerWindow(QtWidgets.QMainWindow):
         self.queue.insert(insert_at, path)
         self.queue_played.insert(insert_at, False)
         self.queue_playlist_entries.insert(insert_at, None)
+        # A genuinely new queue row -- controlled allocation, never a
+        # self-heal. Duplicate identical paths each get their own token.
+        self._queue_entry_tokens.insert(insert_at, _allocate_queue_entry_tokens_for(self, 1)[0])
         self._queue_mutation_epoch = getattr(self, "_queue_mutation_epoch", 0) + 1
         return insert_at
 
@@ -15151,13 +16809,17 @@ class PlayerWindow(QtWidgets.QMainWindow):
     def _keep_played_tracks_at_bottom(self):
         # Keep Up Next as: all unplayed tracks first, played/saveable history last.
         self._ensure_queue_played_flags()
-        combined = list(zip(self.queue, self.queue_played, self.queue_playlist_entries))
+        combined = list(zip(
+            self.queue, self.queue_played, self.queue_playlist_entries,
+            self._queue_entry_tokens,
+        ))
         unplayed = [entry for entry in combined if not entry[1]]
         played_items = [entry for entry in combined if entry[1]]
         ordered = unplayed + played_items
-        self.queue = [p for p, _, _ in ordered]
-        self.queue_played = [played for _, played, _ in ordered]
-        self.queue_playlist_entries = [entry for _, _, entry in ordered]
+        self.queue = [p for p, _, _, _ in ordered]
+        self.queue_played = [played for _, played, _, _ in ordered]
+        self.queue_playlist_entries = [entry for _, _, entry, _ in ordered]
+        self._queue_entry_tokens = [token for _, _, _, token in ordered]
 
     def _queue_played_role(self):
         return QtCore.Qt.ItemDataRole.UserRole.value + 1
@@ -15165,9 +16827,326 @@ class PlayerWindow(QtWidgets.QMainWindow):
     def _queue_playlist_role(self):
         return QtCore.Qt.ItemDataRole.UserRole.value + 2
 
+    def _queue_token_role(self):
+        """Phase B: the queue entry's stable runtime token, stored on the
+        widget item itself. _sync_queue_from_list rebuilds queue order
+        from widget order, and CANNOT recover identity from path, title
+        or position -- duplicate identical paths are legal and a drag
+        reorder moves rows arbitrarily. Carrying the token on the item
+        means it moves with the row for free, however the view reorders
+        it."""
+        return QUEUE_ENTRY_TOKEN_ROLE
+
+    # ---- Phase B: stable queue entry identity -------------------------
+
+    def _allocate_queue_entry_token(self) -> int:
+        """Monotonic, never reused within the process lifetime, so a
+        stale async completion holding a dead token can never collide
+        with a later row that happens to occupy the same position."""
+        return _allocate_queue_entry_tokens_for(self, 1)[0]
+
+    def _allocate_queue_entry_tokens(self, count: int) -> List[int]:
+        return _allocate_queue_entry_tokens_for(self, count)
+
+    def _initialise_queue_entry_tokens(self, reason: str) -> None:
+        """Explicit, CONTROLLED (re)allocation of the whole token list --
+        the only sanctioned way to invent identity. Legitimate callers:
+        restoring a persisted session (tokens are runtime-only and are
+        deliberately not serialised), clearing/rebuilding the queue
+        wholesale, and first-use migration for a queue that predates
+        tokens. Never call this to paper over a mismatch after an
+        ordinary mutation -- see _assert_queue_entry_tokens_aligned for
+        why that would be actively dangerous."""
+        self._queue_entry_tokens = self._allocate_queue_entry_tokens(len(self.queue))
+        self._queue_entry_claims = {}
+        diagnostics = getattr(self, "diagnostics", None)
+        if diagnostics is not None:
+            diagnostics.record(
+                "queue", "entry_tokens_initialised",
+                details={"reason": reason, "rows": len(self._queue_entry_tokens)},
+                minimum_level="detailed",
+            )
+
+    def _assert_queue_entry_tokens_aligned(self, operation: str) -> bool:
+        """Token identity must NEVER silently self-heal.
+
+        Once a runtime queue has tokens, a length mismatch means some
+        mutation failed to keep them aligned -- i.e. identity is already
+        corrupt. Truncating or inventing replacements here would convert
+        that corruption into plausible-looking state and let an async
+        completion commit the WRONG track, which is exactly the class of
+        bug Phase B exists to remove. So this fails closed instead:
+        records a diagnostic, drops every claim (no claim can be trusted
+        once alignment is gone) and returns False, which makes commit a
+        no-op for everything. A track not being marked played is
+        recoverable; the wrong track being marked played is not.
+
+        Under pytest it raises instead, so a mutation site that forgets
+        to carry tokens fails loudly in development rather than being
+        silently tolerated."""
+        expected = len(self.queue)
+        actual = len(self._queue_entry_tokens)
+        if actual == expected:
+            return True
+        # getattr: this is the failure path, and must never itself raise
+        # on a partial instance -- the whole point is to report and fail
+        # closed, not to add a second exception on top of the first.
+        details = {
+            "operation": operation, "expected_rows": expected,
+            "token_rows": actual,
+            "epoch": getattr(self, "_queue_mutation_epoch", None),
+        }
+        diagnostics = getattr(self, "diagnostics", None)
+        if diagnostics is not None:
+            diagnostics.record(
+                "queue", "entry_token_alignment_violation",
+                details=details, severity="warning", minimum_level="basic",
+            )
+        self._queue_entry_claims = {}
+        if "PYTEST_CURRENT_TEST" in os.environ:
+            raise AssertionError(
+                f"queue entry token misalignment after {operation}: "
+                f"{actual} tokens for {expected} queue rows"
+            )
+        return False
+
+    def _queue_token_for_row(self, row: int) -> Optional[int]:
+        if not PlayerWindow._assert_queue_entry_tokens_aligned(self, "token_for_row"):
+            return None
+        if 0 <= row < len(self._queue_entry_tokens):
+            return self._queue_entry_tokens[row]
+        return None
+
+    def _queue_row_for_token(self, token: Optional[int]) -> Optional[int]:
+        """Token -> its CURRENT row, resolved at the moment a row is
+        actually needed and never cached across a mutation."""
+        if token is None:
+            return None
+        if not PlayerWindow._assert_queue_entry_tokens_aligned(self, "row_for_token"):
+            return None
+        try:
+            return self._queue_entry_tokens.index(token)
+        except ValueError:
+            return None  # the entry left the queue -- nothing to commit
+
+    def _prune_queue_entry_claims(self, operation: str) -> None:
+        """Instance-facing alias for _prune_queue_entry_claims_for.
+
+        Structural removals (remove/clear/filter) must not leak a claim
+        for a row the user deleted, or _next_unplayed_queue_row would go
+        on skipping an entry that no longer exists. Surviving tokens keep
+        their claims untouched, so a reorder or an undo never disturbs an
+        in-flight attempt."""
+        _prune_queue_entry_claims_for(self, operation)
+
+    def _claim_queue_selection(self, row: Optional[int], *, reason: str):
+        """Instance-facing alias for _claim_queue_selection_for.
+
+        This is the architectural boundary Phase B turns on: a queue entry
+        becomes spoken-for the moment the user (or auto-advance) selects
+        that exact token -- NOT as a side effect of _play_path_direct
+        happening to create a PlaybackAttempt. Keeping it here means the
+        contract holds even when dispatch is stubbed, and means a dispatch
+        that fails before any attempt exists still has an owner to release.
+        """
+        return _claim_queue_selection_for(self, row, reason=reason)
+
+    def _claim_queue_entry_token(
+        self, token: Optional[int], *, attempt_id: Optional[int], reason: str,
+    ) -> None:
+        """Reserve a queue identity FOR A SPECIFIC ATTEMPT. A claimed row
+        is skipped by _next_unplayed_queue_row -- so Manual Next moves
+        PAST a track that is still preparing instead of re-selecting it --
+        but its queue position and played flag are deliberately untouched
+        until that attempt genuinely becomes authoritative playback."""
+        if token is None or attempt_id is None:
+            return
+        self._ensure_queue_played_flags()
+        self._queue_entry_claims[token] = attempt_id
+        self._record_queue_claim_event("entry_claimed", token, attempt_id, reason)
+
+    def _queue_entry_claim_owner(self, token: Optional[int]) -> Optional[int]:
+        if token is None:
+            return None
+        return (getattr(self, "_queue_entry_claims", None) or {}).get(token)
+
+    def _release_queue_entry_claim(
+        self, token: Optional[int], *, attempt_id: Optional[int], reason: str,
+    ) -> bool:
+        """Release a token's claim ONLY IF `attempt_id` still owns it.
+
+        This ownership check is the whole reason claims map to an owner
+        rather than being a bare set. During a recovery/fallback handoff
+        the replacement attempt takes ownership of the same token and the
+        original then terminates normally -- its FAILED cleanup arrives
+        here, finds it is no longer the owner, and releases nothing. A
+        stale attempt can never drop a claim its replacement now holds.
+        Idempotent; returns True only if this call actually released."""
+        if token is None:
+            return False
+        claims = getattr(self, "_queue_entry_claims", None)
+        if not claims or token not in claims:
+            return False
+        owner = claims[token]
+        if attempt_id is not None and owner != attempt_id:
+            self._record_queue_claim_event(
+                "entry_claim_release_refused", token, attempt_id, reason,
+                current_owner=owner,
+            )
+            return False
+        del claims[token]
+        self._record_queue_claim_event(
+            "entry_claim_released", token, attempt_id, reason,
+        )
+        return True
+
+    def _transfer_queue_entry_claim(
+        self, token: Optional[int], *, from_attempt_id: Optional[int],
+        to_attempt_id: Optional[int], reason: str,
+    ) -> bool:
+        """Hand a claim from a failing attempt to its replacement.
+
+        This is an identity HANDOFF, not an exception to FAILED semantics:
+        ownership moves first, then the original attempt terminates
+        normally and its cleanup is simply a no-op for this token because
+        it no longer owns it."""
+        if token is None or to_attempt_id is None:
+            return False
+        claims = getattr(self, "_queue_entry_claims", None)
+        if claims is None:
+            return False
+        owner = claims.get(token)
+        if owner is None:
+            return False
+        if from_attempt_id is not None and owner != from_attempt_id:
+            return False
+        claims[token] = to_attempt_id
+        self._record_queue_claim_event(
+            "entry_claim_transferred", token, to_attempt_id, reason,
+            previous_owner=owner,
+        )
+        return True
+
+    def _release_attempt_queue_claim(self, attempt, *, reason: str) -> bool:
+        """Release the claim belonging to a terminating attempt -- keyed to
+        that attempt's own queue_entry_id AND its own id, so it can only
+        ever affect its own claim."""
+        if attempt is None:
+            return False
+        return self._release_queue_entry_claim(
+            getattr(attempt, "queue_entry_id", None),
+            attempt_id=getattr(attempt, "attempt_id", None),
+            reason=reason,
+        )
+
+    def _commit_attempt_queue_entry(self, attempt, *, reason: str) -> Optional[int]:
+        """Commit the queue entry a specific attempt selected. Called from
+        the one place each playback path genuinely becomes authoritative
+        (its validated transition to PLAYING), never from dispatch."""
+        if attempt is None:
+            return None
+        return self._commit_queue_entry_token(
+            getattr(attempt, "queue_entry_id", None),
+            attempt_id=getattr(attempt, "attempt_id", None),
+            reason=reason,
+        )
+
+    def _record_queue_claim_event(
+        self, operation: str, token: int, attempt_id: Optional[int], reason: str,
+        **extra,
+    ) -> None:
+        diagnostics = getattr(self, "diagnostics", None)
+        if diagnostics is None:
+            return
+        details = {"token": token, "attempt_id": attempt_id, "reason": reason}
+        details.update(extra)
+        try:
+            diagnostics.record(
+                "queue", operation, details=details, minimum_level="detailed",
+            )
+        except Exception:
+            pass
+
+    def _commit_queue_entry_token(
+        self, token: Optional[int], *, attempt_id: Optional[int] = None, reason: str,
+    ) -> Optional[int]:
+        """THE authoritative queue commit. Releases any claim, resolves the
+        token to its CURRENT row, and performs the existing played +
+        move-to-bottom behaviour exactly once. Returns the post-relocation
+        row, or None if nothing was committed (token gone, already played,
+        or alignment violated).
+
+        Resolving token -> row here, at the moment the row is needed, is
+        the whole point: the queue may have been reordered arbitrarily
+        since the attempt was dispatched, and _mark_queue_row_played
+        relocates the row again as part of committing it."""
+        if token is None:
+            return None
+        PlayerWindow._ensure_queue_played_flags(self)
+        owner = _queue_entry_claim_owner_of(self, token)
+        if owner is not None and attempt_id is not None and owner != attempt_id:
+            # Someone else owns this identity now (a recovery/fallback
+            # replacement took it over). Only the owner may commit it.
+            _record_queue_claim_event_for(
+                self, "entry_commit_refused", token, attempt_id, reason,
+                current_owner=owner,
+            )
+            return None
+        _release_queue_entry_claim_for(
+            self, token, attempt_id=owner, reason=f"{reason}_committed",
+        )
+        row = PlayerWindow._queue_row_for_token(self, token)
+        if row is None:
+            diagnostics = getattr(self, "diagnostics", None)
+            if diagnostics is not None:
+                diagnostics.record(
+                    "queue", "entry_commit_skipped",
+                    details={"token": token, "reason": reason,
+                             "cause": "entry_no_longer_queued"},
+                    minimum_level="detailed",
+                )
+            return None
+        if row < len(self.queue_played) and self.queue_played[row]:
+            return None  # already committed -- commit is idempotent
+        # Instance method deliberately: the focused harnesses stub this to
+        # model (or not model) relocation, and commit must respect that.
+        moved_row = self._mark_queue_row_played(row)
+        diagnostics = getattr(self, "diagnostics", None)
+        if diagnostics is not None:
+            diagnostics.record(
+                "queue", "entry_committed",
+                details={"token": token, "reason": reason,
+                         "attempt_id": attempt_id,
+                         "committed_row": moved_row,
+                         "epoch": getattr(self, "_queue_mutation_epoch", None)},
+                minimum_level="detailed",
+            )
+        return moved_row
+
+    def _ensure_queue_entry_tokens(self):
+        """Instance-facing alias for _bootstrap_queue_entry_tokens.
+
+        BOOTSTRAP ONLY -- deliberately not a self-healing aligner.
+
+        Mirrors how _ensure_queue_played_flags already tolerates a
+        missing queue_playlist_entries on the focused view/controller
+        harnesses that skip the heavyweight constructor: a queue that has
+        never had tokens at all (empty token list, non-empty queue) is
+        legitimate first-use/migration and gets a full allocation. A
+        queue that HAS tokens but the wrong number of them is identity
+        corruption, and is deliberately left alone here so
+        _assert_queue_entry_tokens_aligned fails closed on it rather than
+        this quietly inventing replacements -- see Safeguard 1."""
+        _bootstrap_queue_entry_tokens(self)
+
     def _ensure_queue_played_flags(self):
         if not hasattr(self, "queue_playlist_entries"):
             self.queue_playlist_entries = []
+        # Module-level, not self._ensure_queue_entry_tokens(): the focused
+        # view/controller harnesses reuse individual PlayerWindow methods
+        # on their own classes and do not inherit the rest, so this must
+        # not require the alias method to be resolvable on the instance.
+        _bootstrap_queue_entry_tokens(self)
         if len(self.queue_played) < len(self.queue):
             self.queue_played.extend([False] * (len(self.queue) - len(self.queue_played)))
         elif len(self.queue_played) > len(self.queue):
@@ -15179,11 +17158,30 @@ class PlayerWindow(QtWidgets.QMainWindow):
         elif len(self.queue_playlist_entries) > len(self.queue):
             self.queue_playlist_entries = self.queue_playlist_entries[:len(self.queue)]
 
-    def _next_unplayed_queue_row(self):
+    def _next_unplayed_queue_row(self, exclude_tokens=()):
+        """The next row that is neither played nor already claimed.
+
+        Phase B: a claimed row belongs to an in-flight attempt that has
+        not yet become authoritative playback. Skipping it is what lets
+        Manual Next move PAST a still-preparing track instead of
+        re-selecting the same one -- the behaviour the old optimistic
+        mark-at-dispatch provided, now without reordering the queue or
+        flagging anything played before the track actually plays.
+
+        ``exclude_tokens`` additionally passes over specific entries (those
+        that already failed to dispatch, see _next_track and
+        _automatic_retry_suppressed_tokens_for) without claiming or marking
+        them."""
         self._ensure_queue_played_flags()
+        claimed = set(getattr(self, "_queue_entry_claims", None) or ())
+        excluded = claimed.union(exclude_tokens) if exclude_tokens else claimed
+        tokens = getattr(self, "_queue_entry_tokens", ())
         for row, played in enumerate(self.queue_played):
-            if not played:
-                return row
+            if played:
+                continue
+            if excluded and row < len(tokens) and tokens[row] in excluded:
+                continue
+            return row
         return None
 
     def _queue_entry_is_missing(self, row: int) -> bool:
@@ -15209,8 +17207,18 @@ class PlayerWindow(QtWidgets.QMainWindow):
             return played_rows[pos - 1]
         return played_rows[-1]
 
-    def _mark_queue_row_played(self, row: int):
-        # Played tracks stay saveable, but move to the bottom so the next unplayed song sits at the top.
+    def _mark_queue_row_played(self, row: int) -> Optional[int]:
+        """Marks a queue row played AND RELOCATES IT to the bottom of the
+        queue, returning its new row index (None if `row` was out of
+        range and nothing happened).
+
+        The relocation is the part that bites: self.queue,
+        self.queue_played and self.queue_playlist_entries are all
+        rewritten and _queue_mutation_epoch is bumped, so every row
+        number captured before this call is stale afterwards -- it now
+        refers to whatever track shuffled up into that position. Callers
+        that still need the row MUST use the returned index and must
+        never reuse the one they passed in."""
         self._ensure_queue_played_flags()
         if 0 <= row < len(self.queue_played):
             self.queue_played[row] = True
@@ -15223,17 +17231,29 @@ class PlayerWindow(QtWidgets.QMainWindow):
             )
             self._animate_queue_history_move(moved_row)
             self._schedule_session_save()
+            return moved_row
+        return None
 
     def _move_queue_row_to_bottom(self, row: int) -> int:
         if not (0 <= row < len(self.queue)):
             return row
+        _bootstrap_queue_entry_tokens(self)
         path = self.queue.pop(row)
         entry = self.queue_playlist_entries.pop(row)
         if row < len(self.queue_played):
             self.queue_played.pop(row)
+        # The token travels with its row, which is exactly what makes a
+        # committed entry still resolvable afterwards even though its row
+        # number changed.
+        token = (
+            self._queue_entry_tokens.pop(row)
+            if row < len(self._queue_entry_tokens) else None
+        )
         self.queue.append(path)
         self.queue_played.append(True)
         self.queue_playlist_entries.append(entry)
+        if token is not None:
+            self._queue_entry_tokens.append(token)
         self._queue_mutation_epoch = getattr(self, "_queue_mutation_epoch", 0) + 1
         return len(self.queue) - 1
 
@@ -15790,6 +17810,9 @@ class PlayerWindow(QtWidgets.QMainWindow):
         item.setData(QtCore.Qt.ItemDataRole.UserRole, path)
         item.setData(self._queue_played_role(), played)
         item.setData(self._queue_playlist_role(), entry)
+        _bootstrap_queue_entry_tokens(self)
+        if row < len(self._queue_entry_tokens):
+            item.setData(QUEUE_ENTRY_TOKEN_ROLE, self._queue_entry_tokens[row])
         item.setToolTip(
             ("Played - " if played else "") + label
             + (
@@ -16161,6 +18184,8 @@ class PlayerWindow(QtWidgets.QMainWindow):
         queue_snapshot = list(self.queue)
         queue_played_snapshot = list(self.queue_played)
         playlist_entry_snapshot = list(self.queue_playlist_entries)
+        _bootstrap_queue_entry_tokens(self)
+        entry_token_snapshot = list(self._queue_entry_tokens)
         queue_snapshot_ms = (time.perf_counter() - snapshot_started) * 1000.0
         signals_started = time.perf_counter()
         queue_signals_were_blocked = self.queue_list.blockSignals(True)
@@ -16257,6 +18282,10 @@ class PlayerWindow(QtWidgets.QMainWindow):
             item.setData(QtCore.Qt.ItemDataRole.UserRole, path)
             item.setData(self._queue_played_role(), played)
             item.setData(self._queue_playlist_role(), playlist_entry)
+            # Identity travels on the item so a drag reorder carries it
+            # for free and _sync_queue_from_list never has to guess.
+            if row < len(entry_token_snapshot):
+                item.setData(QUEUE_ENTRY_TOKEN_ROLE, entry_token_snapshot[row])
             set_data_ms += (time.perf_counter() - stage_started) * 1000.0
             stage_started = time.perf_counter()
             item.setToolTip(
@@ -16420,8 +18449,16 @@ class PlayerWindow(QtWidgets.QMainWindow):
             return
         self._audio_log(f"queue double-click play; row={row}; file={self._audio_name(path)!r}")
         crossfade = self._crossfade_eligible_for_transition(path)
-        if self._play_path_direct(path, crossfade=crossfade, immediate_crossfade=True):
-            self._mark_queue_row_played(row)
+        # Phase B: claim-then-commit, same as auto-advance -- see
+        # _play_next_track. Nothing is marked played on dispatch.
+        token, selection_owner = _claim_queue_selection_for(self, row, reason="queue_double_click")
+        if not self._play_path_direct(
+            path, crossfade=crossfade, immediate_crossfade=True,
+            queue_entry_token=token, queue_selection_owner=selection_owner,
+        ):
+            _release_queue_entry_claim_for(
+                self, token, attempt_id=selection_owner, reason="dispatch_failed",
+            )
 
     def _show_queue_menu(self, pos):
         item = self.queue_list.itemAt(pos)
@@ -16501,8 +18538,11 @@ class PlayerWindow(QtWidgets.QMainWindow):
             row = self.queue_list.row(item)
             if 0 <= row < len(self.queue):
                 with capture_queue_undo(self, "remove"):
+                    _bootstrap_queue_entry_tokens(self)
                     self.queue.pop(row)
                     self.queue_playlist_entries.pop(row)
+                    if row < len(self._queue_entry_tokens):
+                        self._queue_entry_tokens.pop(row)
                     if row < len(self.queue_played):
                         self.queue_played.pop(row)
                     self._remove_queue_row_widget(
@@ -16520,20 +18560,32 @@ class PlayerWindow(QtWidgets.QMainWindow):
         self._handle_normalisation_action(action, actions, [self.current_path])
 
     def _sync_queue_from_list(self, *args):
+        _bootstrap_queue_entry_tokens(self)
         new_queue = []
         new_played = []
         new_entries = []
+        new_tokens = []
         for i in range(self.queue_list.count()):
             item = self.queue_list.item(i)
             path = item.data(QtCore.Qt.ItemDataRole.UserRole)
             played = bool(item.data(self._queue_played_role()))
             playlist_entry = item.data(self._queue_playlist_role())
+            # Identity comes off the item itself and is NEVER matched back
+            # by path/title/position: duplicate identical paths are legal,
+            # and a drag reorder moves rows arbitrarily. An item with no
+            # token (built before this role existed) gets a fresh one
+            # rather than borrowing a neighbour's.
+            token = item.data(QUEUE_ENTRY_TOKEN_ROLE)
             if isinstance(path, str):
                 new_queue.append(path)
                 new_played.append(played)
                 new_entries.append(
                     playlist_entry
                     if isinstance(playlist_entry, PlaylistEntry) else None
+                )
+                new_tokens.append(
+                    int(token) if isinstance(token, int)
+                    else _allocate_queue_entry_tokens_for(self, 1)[0]
                 )
         if len(new_queue) == self.queue_list.count():
             if new_queue != self.queue:
@@ -16548,7 +18600,9 @@ class PlayerWindow(QtWidgets.QMainWindow):
                 self.queue = new_queue
                 self.queue_played = new_played
                 self.queue_playlist_entries = new_entries
+                self._queue_entry_tokens = new_tokens
                 self._keep_played_tracks_at_bottom()
+                _prune_queue_entry_claims_for(self, "sync_queue_from_list_reorder")
                 # A genuine reorder changes what's at any given row -- a
                 # preload/candidate selection recorded by (epoch, row,
                 # path) before this drag-and-drop must not be trusted to
@@ -16563,7 +18617,9 @@ class PlayerWindow(QtWidgets.QMainWindow):
                 self.queue = new_queue
                 self.queue_played = new_played
                 self.queue_playlist_entries = new_entries
+                self._queue_entry_tokens = new_tokens
                 self._keep_played_tracks_at_bottom()
+                _prune_queue_entry_claims_for(self, "sync_queue_from_list")
             self._schedule_session_save()
             getattr(self, "_schedule_queue_duration_refresh", lambda *_: None)("queue_reordered")
 
@@ -16610,9 +18666,15 @@ class PlayerWindow(QtWidgets.QMainWindow):
         def _playlist_insert_fn(final_entries):
             insert_at = self._first_played_queue_row()
             paths = [entry.resolved_path or entry.path for entry in final_entries]
+            _bootstrap_queue_entry_tokens(self)
             self.queue[insert_at:insert_at] = paths
             self.queue_played[insert_at:insert_at] = [False] * len(final_entries)
             self.queue_playlist_entries[insert_at:insert_at] = final_entries
+            # Genuinely new rows -- controlled allocation. Identical paths
+            # already in the queue keep their own distinct tokens.
+            self._queue_entry_tokens[insert_at:insert_at] = (
+                _allocate_queue_entry_tokens_for(self, len(paths))
+            )
             # Always the full, original playlist load -- never the
             # dedup-filtered subset -- so a later "Save Repaired Playlist"
             # can't silently truncate the user's M3U file.
@@ -16695,12 +18757,19 @@ class PlayerWindow(QtWidgets.QMainWindow):
     ):
         if isinstance(selected_queue_row, bool):
             selected_queue_row = None
+        # Phase D: capture the stable queue TOKEN, not just the row.
+        # dialog.exec() below spins a NESTED event loop, which delivers
+        # queued worker completions -- _playlist_loaded, _finish_queue_drop,
+        # _on_scan_finished, the metadata backfill -- several of which
+        # insert or reorder queue rows. A row captured here can therefore
+        # mean a different entry by the time the dialog returns.
+        self._ensure_queue_played_flags()
         missing = []
         for row, entry in enumerate(self.queue_playlist_entries):
             if entry is None or not entry.is_missing:
                 continue
             if selected_queue_row is None or row == selected_queue_row:
-                missing.append((row, entry))
+                missing.append((_queue_token_for_row_of(self, row), entry))
         if not missing:
             QtWidgets.QMessageBox.information(
                 self,
@@ -16739,7 +18808,7 @@ class PlayerWindow(QtWidgets.QMainWindow):
         )
         replacements = {}
         confidence_counts = {"Exact": 0, "Strong": 0, "Possible": 0}
-        for display_row, (queue_row, entry) in enumerate(missing):
+        for display_row, (entry_token, entry) in enumerate(missing):
             original_label = (
                 f"{entry.artist} - {entry.display_title}"
                 if entry.artist and entry.display_title
@@ -16765,12 +18834,12 @@ class PlayerWindow(QtWidgets.QMainWindow):
                 )
                 if suggestion.preselected:
                     combo.setCurrentIndex(1)
-                    replacements[queue_row] = suggestion.path
+                    replacements[entry_token] = (entry, suggestion.path)
             combo.currentIndexChanged.connect(
-                lambda _index, qr=queue_row, widget=combo: (
-                    replacements.__setitem__(qr, widget.currentData())
+                lambda _index, tok=entry_token, ent=entry, widget=combo: (
+                    replacements.__setitem__(tok, (ent, widget.currentData()))
                     if widget.currentData()
-                    else replacements.pop(qr, None)
+                    else replacements.pop(tok, None)
                 )
             )
             table.setCellWidget(display_row, 1, combo)
@@ -16784,7 +18853,7 @@ class PlayerWindow(QtWidgets.QMainWindow):
             )
 
             def browse_for_replacement(
-                _checked=False, qr=queue_row, ent=entry, widget=combo
+                _checked=False, ent=entry, widget=combo
             ):
                 original_parent = os.path.dirname(ent.original_path or ent.path)
                 start = (
@@ -16828,13 +18897,33 @@ class PlayerWindow(QtWidgets.QMainWindow):
         repairs = 0
         manual = 0
         repaired_paths = []
-        for queue_row, replacement in replacements.items():
+        for token, (captured_entry, replacement) in replacements.items():
+            # Token LOCATES the logical queue entry; the captured entry
+            # object PROVES it is still the content this repair was chosen
+            # for. Both are required -- and neither is a path lookup,
+            # because duplicate identical paths are legal.
+            queue_row = _queue_row_for_token_of(self, token)
+            if queue_row is None:
+                continue  # the entry left the queue while the dialog was open
             if not (0 <= queue_row < len(self.queue_playlist_entries)):
                 continue
             entry = self.queue_playlist_entries[queue_row]
             if entry is None or not entry.is_missing:
                 continue
+            if entry is not captured_entry:
+                # Same token, different content: the entry was replaced
+                # while the dialog was open. Preserve the newer state
+                # rather than overwriting it with a stale repair.
+                self.diagnostics.record(
+                    "playlist", "repair_skipped_stale_entry",
+                    details={"token": token},
+                    severity="warning", minimum_level="basic",
+                )
+                continue
             repaired = entry.with_replacement(replacement)
+            # In-place repair of the SAME logical entry: the row keeps its
+            # token, so an attempt that selected it before the repair still
+            # resolves to it afterwards.
             self.queue_playlist_entries[queue_row] = repaired
             self.queue[queue_row] = repaired.resolved_path
             repairs += 1
@@ -17067,6 +19156,10 @@ class PlayerWindow(QtWidgets.QMainWindow):
             self.label_remaining.setText(f"-{self._format_duration(remaining_sec)}")
 
     def _fade_tick(self):
+        if _automatic_progression_suspended_for(self):
+            # Astra F2: crossfade and mixed-media fades hold while paused;
+            # Resume shifts their start by the paused time.
+            return
         if self._mixed_transition_state == "active":
             self._mixed_transition_tick()
             return
@@ -17108,10 +19201,21 @@ class PlayerWindow(QtWidgets.QMainWindow):
     def _begin_fade(self):
         if not self.prebuffer_active:
             return
+        generation = getattr(self, "_vlc_crossfade_generation", None)
+        if _automatic_progression_suspended_for(self):
+            # Astra F2 (Phase 4.2): held -- the incoming track is paused with
+            # playback, and Resume begins the fade (for this crossfade only).
+            self._held_vlc_fade_generation = generation
+            return
         if self.inactive_player and not self.inactive_player.is_playing():
             if self.fade_waits < 20:
                 self.fade_waits += 1
-                QtCore.QTimer.singleShot(100, self._begin_fade)
+
+                def _retry_vlc_fade(scheduled=generation):
+                    if scheduled == getattr(self, "_vlc_crossfade_generation", None):
+                        self._begin_fade()
+
+                QtCore.QTimer.singleShot(100, _retry_vlc_fade)
                 return
         self.fade_active = True
         self.fade_start = time.time()

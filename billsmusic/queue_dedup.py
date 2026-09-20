@@ -15,6 +15,26 @@ def normalize_path_for_comparison(path: str) -> str:
     return os.path.normcase(os.path.normpath(path))
 
 
+def same_logical_source(left: object, right: object) -> bool:
+    """True when two source strings name the same logical media.
+
+    Filesystem paths are compared with normalize_path_for_comparison above.
+    A plex:// identity is NOT a filesystem path -- normcase/normpath would
+    mangle its scheme and separators -- so those are compared exactly, and
+    a Plex identity never equals a filesystem path. Callers that need to
+    validate "is this still the same source?" should use this rather than
+    normalising blindly.
+    """
+    if not left or not right:
+        return False
+    left, right = str(left), str(right)
+    left_is_plex = left.startswith("plex://")
+    right_is_plex = right.startswith("plex://")
+    if left_is_plex or right_is_plex:
+        return left_is_plex and right_is_plex and left == right
+    return normalize_path_for_comparison(left) == normalize_path_for_comparison(right)
+
+
 def build_normalized_path_set(paths: Iterable[str]) -> set:
     return {normalize_path_for_comparison(p) for p in paths if p}
 

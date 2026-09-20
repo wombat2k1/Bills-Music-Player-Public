@@ -24,7 +24,18 @@ def qapplication():
 
 
 def _identity(row=3, path="video_b.mp4", epoch=0, media_type=MediaType.VIDEO):
-    return SecondaryIdentity(epoch=epoch, row=row, path=path, media_type=media_type)
+    """Phase D: identity is (queue_token, expected_source).
+
+    The `row=` and `epoch=` keywords are kept only so the existing call
+    sites read unchanged -- across this suite `row=` was never a position
+    that mattered, it was simply "a different target", which is now
+    exactly what a different TOKEN means. `epoch=` is accepted and
+    ignored: an unrelated queue mutation no longer invalidates a preload,
+    which is the behavioural point of this change.
+    """
+    return SecondaryIdentity(
+        queue_token=row, expected_source=path, media_type=media_type,
+    )
 
 
 def _progress_details(engine, **extra):
@@ -125,13 +136,20 @@ def test_controller_is_ready_for_requires_matching_identity():
     assert controller.is_ready_for(identity) is True
 
 
-def test_controller_is_stale_checks_epoch_and_path():
+def test_controller_is_stale_checks_token_and_source():
+    """Phase D: token locates, source validates -- and an unrelated queue
+    mutation (which used to bump the epoch) no longer invalidates."""
     controller = DualDeckController()
-    identity = _identity(epoch=1, path="video_b.mp4")
-    controller.begin_preload(identity)
-    assert controller.is_stale(1, "video_b.mp4") is False
-    assert controller.is_stale(2, "video_b.mp4") is True
-    assert controller.is_stale(1, "different.mp4") is True
+    controller.begin_preload(_identity(row=7, path="video_b.mp4"))
+
+    # Same token, same content -> still valid.
+    assert controller.is_stale(_identity(row=7, path="video_b.mp4")) is False
+    # Same token, content replaced in place (missing-track repair) -> stale.
+    assert controller.is_stale(_identity(row=7, path="different.mp4")) is True
+    # A different queue entry leads now -> stale.
+    assert controller.is_stale(_identity(row=8, path="video_b.mp4")) is True
+    # Nothing queued at all -> stale.
+    assert controller.is_stale(None) is True
 
 
 def test_controller_cancel_refuses_once_committed():
@@ -325,7 +343,10 @@ def test_secondary_ready_signal_moves_to_ready_when_identity_matches():
 def test_secondary_ready_invalidated_by_identity_change():
     engine, backend, identity_holder, _advances, events, _pre = _engine()
     engine.observe_position(4500, 10000, MediaType.VIDEO)
-    identity_holder["value"] = _identity(epoch=1, path="video_b.mp4")
+    # Phase D: invalidation now means the ENTRY changed, not that some
+    # unrelated queue edit bumped a global counter. A different token
+    # leading is a genuine identity change.
+    identity_holder["value"] = _identity(row=99, path="video_b.mp4")
     engine.on_secondary_ready()
     assert engine.state == DualDeckState.IDLE
     assert backend.cancelled_count == 1
@@ -689,7 +710,9 @@ def test_commit_time_staleness_invalidates_and_falls_back():
     engine, backend, identity_holder, advances, events, _pre = _engine()
     engine.observe_position(4500, 10000, MediaType.VIDEO)
     engine.on_secondary_ready()
-    identity_holder["value"] = _identity(epoch=1, path="video_b.mp4")
+    # Same token, content replaced in place (the missing-track-repair
+    # case) -- the prepared media no longer belongs to that entry.
+    identity_holder["value"] = _identity(path="repaired.mp4")
     assert engine.try_commit("automatic", 1.0) is False
     assert advances == []
     assert backend.cancelled_count == 1

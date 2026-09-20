@@ -73,6 +73,17 @@ class VideoTransitionOverlay(QtWidgets.QWidget):
     ) -> None:
         self._begin(effect, "incoming", 1.0, 0.0, duration_ms, finished)
 
+    def pause_animation(self) -> None:
+        """Freeze a running animation where it is (Astra F2: Pause)."""
+        animation = self._animation
+        if animation is not None and animation.state() == QtCore.QAbstractAnimation.State.Running:
+            animation.pause()
+
+    def resume_animation(self) -> None:
+        animation = self._animation
+        if animation is not None and animation.state() == QtCore.QAbstractAnimation.State.Paused:
+            animation.resume()
+
     def show_covered(self, effect: str) -> None:
         self._stop_animation()
         self._effect = effect

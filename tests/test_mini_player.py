@@ -2,6 +2,7 @@ import os
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+import pytest
 from PyQt6 import QtCore, QtGui, QtWidgets
 
 from billsmusic.mini_player import MiniPlayerWindow
@@ -15,6 +16,26 @@ def _app():
     global _APP
     _APP = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     return _APP
+
+
+@pytest.fixture(autouse=True)
+def _close_mini_players_left_open():
+    """MiniPlayerWindow.closeEvent ignores a close unless _allow_close is set
+    (the real PlayerWindow sets it before closing the mini player). A mini
+    player a test leaves visible therefore survives in the process and,
+    under Qt 6, vetoes every later QApplication.quit() -- so any later test
+    that runs app.exec() and quits it on a timer (e.g.
+    test_video_transition_point_analyzer.py) waited forever on a shared
+    xdist worker. Close them the way the real owner does."""
+    yield
+    app = QtWidgets.QApplication.instance()
+    if app is None:
+        return
+    for widget in app.topLevelWidgets():
+        if isinstance(widget, MiniPlayerWindow) and widget.isVisible():
+            widget._allow_close = True
+            widget.close()
+    app.processEvents()
 
 
 class OwnerHarness(QtWidgets.QMainWindow):

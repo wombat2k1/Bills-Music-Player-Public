@@ -29,10 +29,14 @@ def _app():
 class _PlayDirectSpy:
     def __init__(self, result=True):
         self.calls = []
+        self.queue_entry_tokens = []
         self.result = result
 
-    def __call__(self, path, crossfade=False, index=None, immediate_crossfade=False):
+    def __call__(self, path, crossfade=False, index=None, immediate_crossfade=False,
+                 identity_path=None, media_type_override=None, queue_entry_token=None,
+                 queue_selection_owner=None):
         self.calls.append(path)
+        self.queue_entry_tokens.append(queue_entry_token)
         return self.result
 
 
@@ -73,9 +77,18 @@ def test_next_track_advances_through_a_mixed_music_karaoke_video_queue():
     window._queue_entry_is_missing = _queue_entry_is_missing
 
     def _next_unplayed_queue_row():
+        # Phase B: a row CLAIMED by an in-flight selection/attempt is
+        # already spoken for and is skipped, exactly as the real
+        # _next_unplayed_queue_row does. Nothing is marked played at
+        # dispatch any more, so the claim is what advances the queue.
+        claims = getattr(window, "_queue_entry_claims", None) or {}
+        tokens = getattr(window, "_queue_entry_tokens", ())
         for i, played in enumerate(window.queue_played):
-            if not played:
-                return i
+            if played:
+                continue
+            if i < len(tokens) and tokens[i] in claims:
+                continue
+            return i
         return None
 
     window._next_unplayed_queue_row = _next_unplayed_queue_row
@@ -275,7 +288,7 @@ def test_karaoke_forces_local_output_when_cast_is_active(tmp_path):
     window._stop_video_for_audio_transition = lambda: None
     window._cancel_fade = lambda: None
     window._stop_all = lambda: None
-    window._activate_track_ui = lambda index, path: None
+    window._activate_track_ui = lambda path, *, library_index=None, queue_token=None: None
     window._refresh_visualiser_lifecycle = lambda reason: None
     window._force_local_output_for_video = lambda: setattr(
         calls, "force_local_output", calls.force_local_output + 1

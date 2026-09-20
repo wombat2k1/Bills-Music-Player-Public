@@ -51,3 +51,8 @@ Desktop.ini
 # IDE
 .vscode/
 .idea/
+
+# Local third-party bundles and generated packages
+/vendor/
+/nuitka-*/
+/installer/

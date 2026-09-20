@@ -91,7 +91,7 @@ def _base_window(media_type, overlay_visible=True):
 def test_music_to_video_hides_overlay():
     window = _base_window(MediaType.AUDIO, overlay_visible=True)
     window._current_media_type = MediaType.VIDEO
-    PlayerWindow._activate_track_ui(window, None, "clip.mp4")
+    PlayerWindow._activate_track_ui(window, "clip.mp4")
     assert window.overlay.isVisible() is False
     assert window._now_playing_overlay_suppressed is True
 
@@ -106,7 +106,7 @@ def test_video_to_music_restores_overlay():
     window._now_playing_overlay_was_visible = True
 
     window._current_media_type = MediaType.AUDIO
-    PlayerWindow._activate_track_ui(window, None, "song.mp3")
+    PlayerWindow._activate_track_ui(window, "song.mp3")
 
     assert window.overlay.isVisible() is True
     assert window._now_playing_overlay_suppressed is False
@@ -117,7 +117,7 @@ def test_video_to_music_restores_overlay():
 def test_music_to_karaoke_hides_overlay():
     window = _base_window(MediaType.AUDIO, overlay_visible=True)
     window._current_media_type = MediaType.KARAOKE
-    PlayerWindow._activate_track_ui(window, None, "song.cdg")
+    PlayerWindow._activate_track_ui(window, "song.cdg")
     assert window.overlay.isVisible() is False
     assert window._now_playing_overlay_suppressed is True
 
@@ -131,7 +131,7 @@ def test_karaoke_to_music_restores_overlay():
     window._now_playing_overlay_was_visible = True
 
     window._current_media_type = MediaType.AUDIO
-    PlayerWindow._activate_track_ui(window, None, "song.mp3")
+    PlayerWindow._activate_track_ui(window, "song.mp3")
 
     assert window.overlay.isVisible() is True
     assert window._now_playing_overlay_suppressed is False
@@ -141,14 +141,14 @@ def test_karaoke_to_music_restores_overlay():
 
 def test_video_to_video_does_not_retoggle_already_hidden_overlay():
     window = _base_window(MediaType.VIDEO, overlay_visible=True)
-    PlayerWindow._activate_track_ui(window, None, "first.mp4")
+    PlayerWindow._activate_track_ui(window, "first.mp4")
     assert window.overlay.hide_calls == 1
     assert window._now_playing_overlay_suppressed is True
 
     # Second video track begins while still in VIDEO -- must not call
     # hide() again (that would be a redundant, flicker-risking toggle).
     window._current_media_type = MediaType.VIDEO
-    PlayerWindow._activate_track_ui(window, None, "second.mp4")
+    PlayerWindow._activate_track_ui(window, "second.mp4")
     assert window.overlay.hide_calls == 1
 
 
@@ -159,12 +159,12 @@ def test_overlay_already_hidden_before_video_stays_hidden_after_returning_to_mus
     # User had manually hidden the overlay (or some other feature hid it)
     # before video playback ever started.
     window._current_media_type = MediaType.VIDEO
-    PlayerWindow._activate_track_ui(window, None, "clip.mp4")
+    PlayerWindow._activate_track_ui(window, "clip.mp4")
     assert window.overlay.isVisible() is False
     assert window._now_playing_overlay_was_visible is False
 
     window._current_media_type = MediaType.AUDIO
-    PlayerWindow._activate_track_ui(window, None, "song.mp3")
+    PlayerWindow._activate_track_ui(window, "song.mp3")
     # Restored to its pre-video state -- still hidden, not forced back on.
     assert window.overlay.isVisible() is False
 

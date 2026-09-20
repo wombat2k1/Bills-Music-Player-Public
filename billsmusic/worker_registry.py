@@ -40,11 +40,35 @@ class _WorkerHandle:
         self.finalize_after_join = finalize_after_join
 
 
+#: Overall wall-clock budget shutdown_all() may spend joining workers.
+#: Individual wait_ms budgets are retained but clamped to whatever of
+#: this remains, so N slow workers cost this once rather than N times.
+DEFAULT_SHUTDOWN_DEADLINE_MS = 8000
+
+
 class WorkerLifetimeRegistry:
-    def __init__(self, diagnostics=None):
+    """GUI-THREAD-ONLY. register(), unregister(), active_count() and
+    shutdown_all() all mutate/read a plain dict with no lock, and are
+    only ever correct when called from the GUI thread.
+
+    This holds today because every unregister() call site is a lambda
+    connected to a worker's ``finished`` signal, and PyQt creates the
+    connection proxy in the thread that called connect() (always the GUI
+    thread here), so delivery is queued onto the GUI thread even though
+    the signal is emitted as a worker's run() returns. A single direct
+    unregister() call from inside a worker's own run() would silently
+    break that invariant -- register from the dispatch site and release
+    from a ``finished`` handler, never from worker-thread code.
+    """
+
+    def __init__(self, diagnostics=None, monotonic=None):
         self._diagnostics = diagnostics
         self._next_token = itertools.count(1)
         self._workers: dict = {}
+        # Injectable purely so shutdown_all()'s deadline arithmetic can be
+        # driven deterministically by tests; production always uses the
+        # real clock.
+        self._monotonic = monotonic if monotonic is not None else time.monotonic
 
     def register(
         self, category: str, *,
@@ -95,11 +119,37 @@ class WorkerLifetimeRegistry:
     def active_count(self) -> int:
         return len(self._workers)
 
-    def shutdown_all(self) -> None:
+    def active_workers(self) -> list:
+        """[(token, category), ...] for everything still registered, in
+        registration order. Used by the shutdown grace-expiry path to name
+        exactly which workers were never proven finished; carries no
+        worker-supplied content, only the category label this registry was
+        constructed with and its own token."""
+        return [(h.token, h.category) for h in self._workers.values()]
+
+    def shutdown_all(self, *, deadline_ms: Optional[int] = DEFAULT_SHUTDOWN_DEADLINE_MS) -> None:
         """Requests cancellation of every still-registered worker, then
         bound-waits each one that exposes a wait(ms) join. Never raises --
         a worker's own cancel()/wait()/finalize_after_join misbehaving
         must not abort the rest of shutdown.
+
+        OVERALL DEADLINE (Phase C2 fix, blocker 2): cancellation is always
+        requested for EVERY registered worker first, before any waiting
+        begins -- a slow join must never delay another worker being told
+        to stop. Each worker then keeps its own configured wait_ms budget,
+        clamped to whatever remains of ``deadline_ms`` measured across the
+        whole call; once that overall budget is exhausted the remaining
+        workers are not waited on at all (recorded as
+        worker_deadline_exhausted, one per skipped worker). Without this,
+        the joins are sequential and additive: several registered
+        categories at 1500-15000ms each can freeze the GUI thread for
+        25s+ on a close. Pass deadline_ms=None to restore the old
+        unbounded-in-aggregate behaviour.
+
+        A worker skipped because the overall deadline was exhausted is in
+        exactly the same position as one that timed out individually: NOT
+        proven finished, so it stays registered and its
+        finalize_after_join never runs (see below).
 
         UNKNOWN != FINISHED (Phase C2, 2026-09-11): a worker is only ever
         released from this registry when its completion has been
@@ -122,6 +172,7 @@ class WorkerLifetimeRegistry:
                     self._record("worker_cancel_error", handle.category, handle.token)
                 else:
                     self._record("worker_cancel_requested", handle.category, handle.token)
+        deadline = None if deadline_ms is None else self._monotonic() + (deadline_ms / 1000.0)
         for handle in pending:
             if handle.thread is None:
                 # No wait-capable object registered -- shutdown_all()
@@ -130,23 +181,39 @@ class WorkerLifetimeRegistry:
                 # by its own explicit unregister() call elsewhere (its
                 # own completion path). See register()'s docstring.
                 continue
-            started = time.monotonic()
+            wait_ms = handle.wait_ms
+            if deadline is not None:
+                remaining_ms = (deadline - self._monotonic()) * 1000.0
+                if remaining_ms <= 0:
+                    # Overall budget gone -- do not wait on this or any
+                    # later worker. Distinct from an individual timeout:
+                    # this one was never given a chance to be proven.
+                    self._record(
+                        "worker_deadline_exhausted", handle.category, handle.token,
+                    )
+                    continue
+                wait_ms = min(wait_ms, int(remaining_ms))
+            started = self._monotonic()
             try:
-                finished = bool(handle.thread.wait(handle.wait_ms))
+                finished = bool(handle.thread.wait(wait_ms))
             except Exception:
-                elapsed_ms = round((time.monotonic() - started) * 1000.0, 1)
+                elapsed_ms = round((self._monotonic() - started) * 1000.0, 1)
                 self._record(
                     "worker_wait_error", handle.category, handle.token,
                     elapsed_ms=elapsed_ms,
                 )
                 continue
             if not finished:
-                elapsed_ms = round((time.monotonic() - started) * 1000.0, 1)
+                elapsed_ms = round((self._monotonic() - started) * 1000.0, 1)
                 self._record(
                     "worker_join_timeout", handle.category, handle.token,
-                    elapsed_ms=elapsed_ms,
+                    elapsed_ms=elapsed_ms, waited_ms=wait_ms,
                 )
                 continue
+            self._record(
+                "worker_joined", handle.category, handle.token,
+                elapsed_ms=round((self._monotonic() - started) * 1000.0, 1),
+            )
             if handle.finalize_after_join is not None:
                 try:
                     handle.finalize_after_join()

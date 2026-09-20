@@ -268,7 +268,10 @@ class DispatchHarness:
         self._audio_name = lambda path: path.rsplit("/", 1)[-1]
         self._set_playing_button_state = lambda: None
         self._activate_track_ui_calls = []
-        self._activate_track_ui = lambda index, path: self._activate_track_ui_calls.append((index, path))
+        self._activate_track_ui = (
+            lambda path, *, library_index=None, queue_token=None:
+            self._activate_track_ui_calls.append((library_index, path))
+        )
         self._reset_progress = lambda: None
         self._arm_playback_watchdog_calls = []
         self._arm_playback_watchdog = lambda pos=0.0: self._arm_playback_watchdog_calls.append(pos)

@@ -102,7 +102,7 @@ def test_load_lyrics_for_track_reports_none_when_nothing_found(tmp_path, monkeyp
 def _window_with_cache(cache, generation=None, set_calls=None, stale_calls=None):
     if generation is None:
         generation = window_module.NowPlayingGeneration()
-        generation.begin("song.mp3", None)
+        generation.begin("song.mp3")
     set_calls = set_calls if set_calls is not None else []
     stale_calls = stale_calls if stale_calls is not None else []
     return SimpleNamespace(
@@ -123,7 +123,7 @@ def test_load_lrc_for_track_cache_hit_performs_no_io_and_no_worker(monkeypatch):
     monkeypatch.setattr(window_module, "LyricsLoadWorker", _fail)
 
     generation = window_module.NowPlayingGeneration()
-    generation.begin("song.mp3", None)
+    generation.begin("song.mp3")
     set_calls = []
     window = _window_with_cache(
         {"song.mp3": ([(1.0, "cached line")], "tags")},
@@ -152,7 +152,7 @@ def test_load_lrc_for_track_drops_stale_worker_result(monkeypatch):
     monkeypatch.setattr(window_module, "LyricsLoadWorker", _FakeWorker)
 
     generation = window_module.NowPlayingGeneration()
-    identity = generation.begin("song.mp3", None)
+    identity = generation.begin("song.mp3")
     requested_generation = identity.generation
 
     set_calls = []
@@ -165,7 +165,7 @@ def test_load_lrc_for_track_drops_stale_worker_result(monkeypatch):
     PlayerWindow._load_lrc_for_track(window, "song.mp3", generation=requested_generation)
 
     # User skips to a different track before the background read finishes.
-    generation.begin("other.mp3", None)
+    generation.begin("other.mp3")
 
     worker = window._lyrics_load_workers[0]
     worker.lyrics_ready.slot("song.mp3", [(1.0, "late line")], "tags")

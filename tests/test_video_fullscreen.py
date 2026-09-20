@@ -1259,6 +1259,12 @@ def _make_shutdown_capable(window):
     window._shutdown_pending = False
     window._shutdown_complete = False
     window._shutdown_finalizing = False
+    # Shutdown grace timer (added by the stuck-worker shutdown hardening):
+    # substituted exactly as test_shutdown_hardening.py does, so the real
+    # QTimer -> _force_process_exit (os._exit) can never fire in the runner.
+    window._shutdown_grace_timer = None
+    window._arm_shutdown_grace_timer = lambda: setattr(window, "_shutdown_grace_timer", object())
+    window._cancel_shutdown_grace_timer = lambda: setattr(window, "_shutdown_grace_timer", None)
     window._playback_generation = 0
     window._plex_audio_load_token = 0
     window._crossfade_load_token = 0
@@ -1591,6 +1597,61 @@ def test_party_mode_fullscreen_uses_party_presentation_without_reparenting():
     party_mode.exit_video_fullscreen_presentation.assert_called_once_with({"party": True})
     backend.attach_output.assert_not_called()
     party_mode.close()
+    window.close()
+
+
+def test_stop_during_active_mixed_audio_to_video_overlap_leaves_real_fullscreen():
+    """Phase 1.1: real fullscreen presentation (real enter/exit methods on
+    the real nested window) entered during an active Audio->Video mixed
+    overlap, then the real stop_playback. Stop cancels the transition
+    first, which returns the logical media type to AUDIO before the
+    ordinary video teardown runs -- fullscreen must still be exited."""
+    app, window, page, video_output, backend = _main_video_window()
+    window._enter_video_fullscreen()
+    app.processEvents()
+    assert window._video_fullscreen is True
+
+    # State of an active Audio->Video overlap (see _activate_mixed_media_transition).
+    window._closing = False
+    window._mixed_transition_id = 7
+    window._mixed_transition_state = "active"
+    window._mixed_transition_direction = "audio_to_video"
+    window._mixed_transition_incoming_token = None
+    window.pending_next = True
+    window._reset_mixed_media_transition_state = (
+        lambda: PlayerWindow._reset_mixed_media_transition_state(window)
+    )
+    window._cancel_mixed_media_transition = (
+        lambda reason, **kw: PlayerWindow._cancel_mixed_media_transition(window, reason, **kw)
+    )
+    window._stop_video_for_audio_transition = (
+        lambda: PlayerWindow._stop_video_for_audio_transition(window)
+    )
+    window._detach_video_from_party_mode = lambda: None
+    window._resume_deferred_queue_analysis = lambda: None
+    window._current_playback_attempt = None
+    window._cancel_current_playback_attempt = lambda reason: None
+    window._video_transition_manager = None
+    window.cast_active = False
+    window._cancel_fade = lambda: None
+    window._stop_all = lambda: None
+    window._cancel_playback_watchdog = lambda: None
+    window._playback_expected = True
+    window._playback_intentionally_paused = False
+    window.beat = SimpleNamespace(setFocus=lambda *a, **kw: None, setPlaying=lambda playing: None)
+    window._reset_progress = lambda: None
+    window._sync_now_playing_overlay_for_media_type = lambda: None
+    window._announce_accessible_status = lambda message: None
+
+    PlayerWindow.stop_playback(window)
+    app.processEvents()
+
+    assert window._video_fullscreen is False
+    assert not window.isFullScreen()
+    assert window._mixed_transition_state == "idle"
+    assert window._current_media_type == MediaType.AUDIO
+    assert window.right_display_stack.currentWidget() is window._normal_display_page
+    backend.stop.assert_called()
     window.close()
 
 

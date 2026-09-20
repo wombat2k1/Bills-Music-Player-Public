@@ -59,7 +59,7 @@ def test_video_track_skips_analyzer_and_waveform():
     window, analyzer, analyzer_worker, waveform_worker, waveform_seekbar = _activate_ui_window(
         MediaType.VIDEO
     )
-    PlayerWindow._activate_track_ui(window, None, "clip.mp4")
+    PlayerWindow._activate_track_ui(window, "clip.mp4")
     analyzer.load.assert_not_called()
     analyzer_worker.update_track.emit.assert_not_called()
     waveform_worker.request.assert_not_called()
@@ -73,7 +73,7 @@ def test_video_track_skips_jukebox_intro_overlay():
     # reported as the title card rendering partly behind the black video
     # surface. Video's own picture is already the visual, so skip it.
     window, *_ = _activate_ui_window(MediaType.VIDEO)
-    PlayerWindow._activate_track_ui(window, None, "clip.mp4")
+    PlayerWindow._activate_track_ui(window, "clip.mp4")
     window._start_jukebox_intro.assert_not_called()
 
 
@@ -81,7 +81,7 @@ def test_audio_track_still_reaches_analyzer_and_waveform():
     window, analyzer, analyzer_worker, waveform_worker, waveform_seekbar = _activate_ui_window(
         MediaType.AUDIO
     )
-    PlayerWindow._activate_track_ui(window, None, "song.mp3")
+    PlayerWindow._activate_track_ui(window, "song.mp3")
     analyzer.load.assert_called_once_with("song.mp3")
     analyzer_worker.update_track.emit.assert_called_once_with("song.mp3")
     waveform_worker.request.assert_called_once_with("song.mp3")
@@ -103,7 +103,7 @@ def test_plex_audio_track_skips_offline_analyzer_and_waveform_decode():
     window, analyzer, analyzer_worker, waveform_worker, waveform_seekbar = _activate_ui_window(
         MediaType.AUDIO
     )
-    PlayerWindow._activate_track_ui(window, None, PLEX_AUDIO_PATH)
+    PlayerWindow._activate_track_ui(window, PLEX_AUDIO_PATH)
     analyzer.load.assert_not_called()
     analyzer_worker.update_track.emit.assert_not_called()
     waveform_worker.request.assert_not_called()
@@ -121,7 +121,7 @@ def test_plex_audio_track_still_loads_lyrics_and_jukebox_intro():
     # Only the offline analyzer/waveform-decode calls are Plex-excluded --
     # everything else _activate_track_ui does for AUDIO is unaffected.
     window, *_ = _activate_ui_window(MediaType.AUDIO)
-    PlayerWindow._activate_track_ui(window, None, PLEX_AUDIO_PATH)
+    PlayerWindow._activate_track_ui(window, PLEX_AUDIO_PATH)
     window._load_lrc_for_track.assert_called_once_with(PLEX_AUDIO_PATH)
     window._clear_synced_lyrics_state.assert_not_called()
 
@@ -135,20 +135,20 @@ def test_plex_audio_track_still_loads_lyrics_and_jukebox_intro():
 
 def test_video_track_skips_lyrics_lookup():
     window, *_ = _activate_ui_window(MediaType.VIDEO)
-    PlayerWindow._activate_track_ui(window, None, "clip.mp4")
+    PlayerWindow._activate_track_ui(window, "clip.mp4")
     window._load_lrc_for_track.assert_not_called()
     window._clear_synced_lyrics_state.assert_called_once()
 
 
 def test_karaoke_track_skips_lyrics_lookup():
     window, *_ = _activate_ui_window(MediaType.KARAOKE)
-    PlayerWindow._activate_track_ui(window, None, "song.cdg")
+    PlayerWindow._activate_track_ui(window, "song.cdg")
     window._load_lrc_for_track.assert_not_called()
     window._clear_synced_lyrics_state.assert_called_once()
 
 
 def test_audio_track_still_loads_lyrics():
     window, *_ = _activate_ui_window(MediaType.AUDIO)
-    PlayerWindow._activate_track_ui(window, None, "song.mp3")
+    PlayerWindow._activate_track_ui(window, "song.mp3")
     window._load_lrc_for_track.assert_called_once_with("song.mp3")
     window._clear_synced_lyrics_state.assert_not_called()

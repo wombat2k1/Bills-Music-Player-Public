@@ -260,3 +260,104 @@ def test_wait_error_recorded_as_a_distinct_event_from_join_timeout():
     ops = [e[1] for e in diagnostics.events]
     assert "worker_wait_error" in ops
     assert "worker_join_timeout" not in ops  # distinct causes, distinct events
+
+
+# ---------------------------------------------------------------------------
+# Overall shutdown deadline (Phase C2 blocker 2).
+#
+# The joins are sequential, so individual wait_ms budgets are additive:
+# several registered categories at 1500-15000ms each could freeze the GUI
+# thread for 25s+ on a single close. shutdown_all() now spends a bounded
+# overall budget instead, clamping each worker's own wait to whatever
+# remains. Driven by an injected clock so this is exact, not wall-clock
+# flaky.
+# ---------------------------------------------------------------------------
+
+class _FakeClock:
+    def __init__(self):
+        self.now = 0.0
+
+    def __call__(self):
+        return self.now
+
+    def advance(self, seconds):
+        self.now += seconds
+
+
+class _BudgetConsumingThread:
+    """wait(ms) burns exactly the budget it was handed, then reports that
+    the worker did NOT finish -- the stuck-worker case."""
+
+    def __init__(self, clock):
+        self.clock = clock
+        self.waits = []
+
+    def wait(self, ms):
+        self.waits.append(ms)
+        self.clock.advance(ms / 1000.0)
+        return False
+
+
+def test_shutdown_all_respects_an_overall_deadline_across_many_workers():
+    clock = _FakeClock()
+    diagnostics = _FakeDiagnostics()
+    registry = WorkerLifetimeRegistry(diagnostics=diagnostics, monotonic=clock)
+    finalized = []
+    cancelled = []
+    threads = []
+    for index in range(10):
+        thread = _BudgetConsumingThread(clock)
+        threads.append(thread)
+        registry.register(
+            f"category_{index}",
+            cancel=lambda i=index: cancelled.append(i),
+            thread=thread,
+            wait_ms=3000,
+            finalize_after_join=lambda i=index: finalized.append(i),
+        )
+
+    registry.shutdown_all(deadline_ms=5000)
+
+    # Cancellation is requested for EVERY worker before any waiting -- a
+    # slow join must never delay another worker being told to stop.
+    assert sorted(cancelled) == list(range(10))
+    # Exactly the overall budget was spent, not 10 x 3000ms.
+    assert clock.now == 5.0
+    # First worker gets its full 3000ms; the second is clamped to the
+    # 2000ms remaining; the rest are never waited on at all.
+    assert threads[0].waits == [3000]
+    assert threads[1].waits == [2000]
+    assert all(t.waits == [] for t in threads[2:])
+    # Unproven means unproven: every one stays registered, and no
+    # finalizer runs for a worker whose wait() never returned True.
+    assert registry.active_count() == 10
+    assert finalized == []
+    operations = [operation for _, operation, _ in diagnostics.events]
+    assert operations.count("worker_join_timeout") == 2
+    assert operations.count("worker_deadline_exhausted") == 8
+    assert "worker_joined" not in operations
+
+
+def test_shutdown_all_deadline_none_restores_unbounded_aggregate_waiting():
+    clock = _FakeClock()
+    registry = WorkerLifetimeRegistry(monotonic=clock)
+    threads = [_BudgetConsumingThread(clock) for _ in range(4)]
+    for index, thread in enumerate(threads):
+        registry.register(f"category_{index}", thread=thread, wait_ms=3000)
+
+    registry.shutdown_all(deadline_ms=None)
+
+    assert all(t.waits == [3000] for t in threads)
+    assert clock.now == 12.0
+
+
+def test_shutdown_all_records_a_joined_event_for_a_worker_that_proves_finished():
+    diagnostics = _FakeDiagnostics()
+    registry = WorkerLifetimeRegistry(diagnostics=diagnostics)
+    registry.register("bio", thread=_FakeThread(finishes=True))
+
+    registry.shutdown_all()
+
+    operations = [operation for _, operation, _ in diagnostics.events]
+    assert "worker_joined" in operations
+    assert registry.active_count() == 0

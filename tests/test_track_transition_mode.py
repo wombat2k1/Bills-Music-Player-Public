@@ -44,11 +44,19 @@ def test_save_user_settings_persists_track_transition_mode():
 class _PlayDirectSpy:
     def __init__(self, result=True):
         self.calls = []
+        self.queue_entry_tokens = []
         self.result = result
 
-    def __call__(self, path, crossfade=False, index=None, immediate_crossfade=False):
+    def __call__(self, path, crossfade=False, index=None, immediate_crossfade=False,
+                 identity_path=None, media_type_override=None, queue_entry_token=None,
+                 queue_selection_owner=None):
+        # queue_entry_token is accepted but deliberately not recorded:
+        # these tests assert the crossfade/immediate shape of each call,
+        # and Phase B token threading has its own dedicated coverage.
+        self.queue_entry_tokens.append(queue_entry_token)
         self.calls.append(
-            {"path": path, "crossfade": crossfade, "index": index, "immediate_crossfade": immediate_crossfade}
+            {"path": path, "crossfade": crossfade, "index": index,
+             "immediate_crossfade": immediate_crossfade}
         )
         return self.result
 
@@ -518,7 +526,7 @@ def _crossfade_window(outgoing, incoming, **overrides):
         _cached_gain_for_path=lambda path, target="active": 1.0,
         _audio_log=lambda message: None,
         _audio_name=lambda path: path,
-        _activate_track_ui=lambda index, path: None,
+        _activate_track_ui=lambda path, *, library_index=None, queue_token=None: None,
         _begin_playback_recovery=lambda *a, **k: None,
         _current_playback_attempt=None,
         _is_current_playback_attempt=lambda attempt_id: True,
@@ -702,7 +710,10 @@ def test_load_failure_triggers_playback_recovery_for_the_new_track():
         _crossfade_load_token=1, prebuffer_active=True,
         pending_builtin_crossfade_path="next.flac",
         pending_builtin_crossfade_index=7,
-        _activate_track_ui=lambda index, path: activate_calls.append((index, path)),
+        _activate_track_ui=(
+            lambda path, *, library_index=None, queue_token=None:
+            activate_calls.append((library_index, path))
+        ),
         _begin_playback_recovery=lambda *a, **k: recovery_calls.append((a, k)),
     )
     PlayerWindow._on_crossfade_load_failed(window, 1, "next.flac", "disk error")

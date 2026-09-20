@@ -27,6 +27,7 @@ from typing import Callable, Mapping, Optional
 
 from PyQt6 import QtCore
 
+from .queue_dedup import same_logical_source
 from .media_type import MediaType
 
 # Phase 2B/2C -- genuine GPU transition effects, layered onto Phase 2A's
@@ -106,18 +107,35 @@ COMMITTED_STATES = (
 
 @dataclass(frozen=True)
 class SecondaryIdentity:
-    """A stable-enough identity for the queue row a preload targets.
+    """The queue entry a preload targets, and the content it prepared.
 
-    The Up Next queue has no per-row IDs (three parallel index-aligned
-    lists) -- rather than add one, ``epoch`` is a counter bumped by every
-    queue-structure mutation (see window.py's ``_bump_queue_mutation_epoch``).
-    A preload is only trusted to still point at the same logical item if the
-    epoch is unchanged *and* the path at the recorded row still matches.
+    Phase D: token LOCATES, source VALIDATES.
+
+    ``queue_token`` is the Phase B stable queue-entry identity. It survives
+    every reorder, insertion and removal of other rows, and is never reused
+    within the process -- so a departed token can only fail to resolve,
+    never resolve to some other entry. The queue row is deliberately NOT
+    stored: a row is a presentation position, and retaining one is exactly
+    what made the old model fragile.
+
+    ``expected_source`` is the media that was actually prepared. A
+    surviving token alone does not prove the preload is still valid,
+    because missing-track repair deliberately keeps an entry's token while
+    replacing its path -- so an in-place A -> B change under the same
+    token must invalidate a preload of A. Source is only ever used to
+    VALIDATE; the queue is never searched for a matching path (duplicate
+    identical paths are legal and must stay distinguishable).
+
+    This replaces the previous ``(epoch, row, path)`` model. That one was
+    written when the queue had no per-row IDs, and used a global mutation
+    counter as a proxy: strictly conservative, but it discarded a
+    perfectly valid preload whenever ANY unrelated queue edit happened.
+    ``preload_id`` on the controller remains the separate async/backend
+    authority and is untouched by this.
     """
 
-    epoch: int
-    row: Optional[int]
-    path: str
+    queue_token: Optional[int]
+    expected_source: str
     media_type: MediaType
 
 
@@ -394,15 +412,30 @@ class DualDeckController:
             return False
         return self.identity == current_identity
 
-    def is_stale(self, current_epoch: int, current_path_at_row: Optional[str]) -> bool:
-        """True when the queue has structurally changed since preload began
-        in a way that invalidates the recorded target (see
-        ``SecondaryIdentity``'s docstring)."""
+    def is_stale(self, current_identity: Optional[SecondaryIdentity]) -> bool:
+        """True when the preloaded target is no longer valid.
+
+        `current_identity` is what the queue says the next target is RIGHT
+        NOW. Stale means one of:
+
+          the stored token is gone from the queue (the provider returns
+          None, or a different token now leads);
+
+          the same token's content changed in place (repair swapped its
+          path), so the prepared media no longer belongs to that entry.
+
+        An unrelated insert, removal or reorder changes neither, so the
+        preload survives -- which the old epoch-based model could not
+        express."""
         if self.identity is None:
             return False
-        if self.identity.epoch != current_epoch:
+        if current_identity is None:
             return True
-        return current_path_at_row != self.identity.path
+        if current_identity.queue_token != self.identity.queue_token:
+            return True
+        return not same_logical_source(
+            current_identity.expected_source, self.identity.expected_source
+        )
 
     # -- commit / promote / cleanup --------------------------------------
     def begin_commit(self, trigger: str) -> bool:
@@ -480,9 +513,15 @@ class DualVideoTransitionEngine(QtCore.QObject):
         intro_transition_point_lookup: Optional[Callable[[str], Optional[int]]] = None,
         current_primary_path_provider: Optional[Callable[[], Optional[str]]] = None,
         staleness_identity_provider: Optional[Callable[[], Optional[SecondaryIdentity]]] = None,
+        automatic_progress_suspended: Optional[Callable[[], bool]] = None,
     ):
         super().__init__(parent)
         self.controller = DualDeckController(rng)
+        # Astra F2: the player's intentional-Pause authority. While it holds,
+        # a ready secondary stays ready but no automatic commit deadline is
+        # armed and no automatic commit happens; playback_paused(False)
+        # re-arms from the paused position. Manual commits are not gated.
+        self._automatic_progress_suspended = automatic_progress_suspended
         self.preferences = DualTransitionPreferences()
         self._backend = backend
         self._advance_callback = advance_callback
@@ -625,16 +664,21 @@ class DualVideoTransitionEngine(QtCore.QObject):
             return
         if not self.controller.begin_preload(identity):
             return
-        start_position_ms = self._smart_intro_start_ms(identity.path)
+        start_position_ms = self._smart_intro_start_ms(identity.expected_source)
         self._record(
             "preload_requested",
-            {"row": identity.row, "start_position_ms": start_position_ms or 0},
+            {
+                # Diagnostic only -- the TOKEN is the identity; the row it
+                # currently occupies is merely where it happens to be now.
+                "queue_token": identity.queue_token,
+                "start_position_ms": start_position_ms or 0,
+            },
         )
         if start_position_ms:
             self._record("smart_intro_seek_used", {"start_position_ms": start_position_ms})
         failure_reason = None
         try:
-            started = bool(self._backend.preload_secondary(identity.path, start_position_ms=start_position_ms or 0))
+            started = bool(self._backend.preload_secondary(identity.expected_source, start_position_ms=start_position_ms or 0))
         except Exception as ex:
             started = False
             failure_reason = str(ex)
@@ -790,11 +834,11 @@ class DualVideoTransitionEngine(QtCore.QObject):
             self.controller.mark_secondary_failed()
             self.controller.acknowledge_error_recovery()
             return
-        start_position_ms = self._smart_intro_start_ms(identity.path)
+        start_position_ms = self._smart_intro_start_ms(identity.expected_source)
         failure_reason = None
         try:
             started = bool(self._backend.preload_secondary(
-                identity.path, start_position_ms=start_position_ms or 0,
+                identity.expected_source, start_position_ms=start_position_ms or 0,
             ))
         except Exception as ex:
             started = False
@@ -869,8 +913,23 @@ class DualVideoTransitionEngine(QtCore.QObject):
             "total_elapsed_ms": int((now - started) * 1000.0) if started is not None else None,
         })
 
+    def _automatic_progress_is_suspended(self) -> bool:
+        provider = self._automatic_progress_suspended
+        if provider is None:
+            return False
+        try:
+            return bool(provider())
+        except Exception:
+            return False
+
     def _schedule_deadline(self, position_ms: int, duration_ms: int) -> None:
         if duration_ms <= 0:
+            return
+        if self._automatic_progress_is_suspended():
+            # Astra F2: held -- readiness (or a position tick) while paused
+            # must not start the countdown to an automatic commit.
+            self._deadline_timer.stop()
+            self._record("deadline_held_while_paused", {"position_ms": position_ms})
             return
         lead_ms = int(self.preferences.automatic_lead_seconds * 1000.0)
         effective_duration_ms = duration_ms
@@ -978,16 +1037,20 @@ class DualVideoTransitionEngine(QtCore.QObject):
             return False
         if self.controller.state != DualDeckState.SECONDARY_READY:
             return False
+        if trigger == "automatic" and self._automatic_progress_is_suspended():
+            return False  # Astra F2: never commit automatically while paused
         # Re-verifying the already-preloaded identity, not requesting a
         # new preload -- same reasoning as _current_preload_is_stale()'s
         # use of this provider below.
         identity = self._safe_staleness_identity()
         stored = self.controller.identity
-        if identity is None or stored is None or identity.row != stored.row:
-            # Nothing at that row to compare/commit against right now --
-            # not necessarily "stale", just not a match; decline quietly.
+        if identity is None or stored is None or identity.queue_token != stored.queue_token:
+            # A different queue entry leads now -- not necessarily
+            # "stale", just not a match; decline quietly. Compared by
+            # TOKEN, so an unrelated reorder that merely moved this entry
+            # to a different row no longer reads as a mismatch.
             return False
-        if self.controller.is_stale(identity.epoch, identity.path):
+        if self.controller.is_stale(identity):
             self._record("secondary_invalidated_by_queue_change", {})
             self._teardown_secondary()
             self.controller.cancel()
@@ -1040,7 +1103,7 @@ class DualVideoTransitionEngine(QtCore.QObject):
         identity = self.controller.identity
         if self._pre_advance_callback is not None and identity is not None:
             try:
-                self._pre_advance_callback(identity.path)
+                self._pre_advance_callback(identity.expected_source)
             except Exception:
                 pass
         self._record("queue_advance_requested", {"trigger": trigger})
@@ -1193,9 +1256,9 @@ class DualVideoTransitionEngine(QtCore.QObject):
         identity = self._safe_staleness_identity()
         if identity is None or self.controller.identity is None:
             return True
-        if identity.row != self.controller.identity.row:
+        if identity.queue_token != self.controller.identity.queue_token:
             return True
-        return self.controller.is_stale(identity.epoch, identity.path)
+        return self.controller.is_stale(identity)
 
     def _record(self, event: str, details: Mapping[str, object]) -> None:
         callback = self._diagnostic_callback

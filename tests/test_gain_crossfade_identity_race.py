@@ -182,7 +182,7 @@ def _window(**overrides):
         ),
         _audio_log=lambda message: None,
         _audio_name=lambda path: path,
-        _activate_track_ui=lambda index, path: None,
+        _activate_track_ui=lambda path, *, library_index=None, queue_token=None: None,
         _begin_playback_recovery=lambda *a, **k: None,
         _reset_progress=lambda: None,
         _arm_playback_watchdog=lambda position: None,

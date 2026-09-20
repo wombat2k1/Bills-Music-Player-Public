@@ -715,12 +715,40 @@ class _DualDeckCompositorWidget(QtWidgets.QWidget):
         self.move(-32000, -32000)
         self.show()
 
+    @staticmethod
+    def _owned(frame: Optional[QVideoFrame]) -> Optional[QVideoFrame]:
+        """Return a frame this widget genuinely owns, safe to paint later.
+
+        QVideoSink.videoFrameChanged delivers `const QVideoFrame &` -- a
+        reference to the sink's own frame, which PyQt wraps WITHOUT taking
+        a copy. That wrapper is only valid for the duration of the slot
+        call: storing it and using it from a later paintEvent reads freed
+        memory. Confirmed under a debugger on this build -- the faulting
+        stack is QWidgetPrivate::drawWidget -> this widget's paintEvent ->
+        QVideoFrame::isValid, taking 0xC0000005 (and, when the freed block
+        had been reused, 0xC0000374 heap corruption) within a second of
+        playback starting, with no transition and no secondary deck
+        involved. It is what made this compositor unusable (see
+        test_video_dual_transition_fixture_integration.py's skip).
+
+        The copy constructor, called here while the frame is still valid,
+        produces an owned QVideoFrame. QVideoFrame is implicitly shared, so
+        this holds a reference to the decoder's buffer rather than copying
+        the pixels -- the buffer stays alive as long as this widget holds
+        the frame, which is exactly the ownership the paint path needs, at
+        no per-frame conversion cost. Painting still goes through
+        QVideoFrame.paint(), so what is drawn is unchanged.
+        """
+        if frame is None:
+            return None
+        return QVideoFrame(frame)
+
     def set_frame_a(self, frame: Optional[QVideoFrame]) -> None:
-        self._frame_a = frame
+        self._frame_a = self._owned(frame)
         self.update()
 
     def set_frame_b(self, frame: Optional[QVideoFrame]) -> None:
-        self._frame_b = frame
+        self._frame_b = self._owned(frame)
         self.update()
 
     def clear_frame_b(self) -> None:

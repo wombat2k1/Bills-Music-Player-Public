@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import contextlib
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import List, Optional
 
 from .playlist_repair import PlaylistEntry
@@ -46,6 +46,12 @@ class QueueUndoSnapshot:
     selected_rows: List[int]
     scroll_position: Optional[int]
     current_path: Optional[str]
+    # Phase B: the stable runtime token for each row. Undo must RESTORE
+    # identity, not invent it -- an in-flight attempt that selected a row
+    # before the undone mutation must still resolve to that same entry
+    # afterwards, and its claim must survive. Last, with a default, so
+    # existing positional construction stays valid.
+    queue_entry_tokens: List[int] = field(default_factory=list)
 
 
 def snapshot_queue_state(window, action: str) -> QueueUndoSnapshot:
@@ -64,6 +70,7 @@ def snapshot_queue_state(window, action: str) -> QueueUndoSnapshot:
         queue=list(window.queue),
         queue_played=list(window.queue_played),
         queue_playlist_entries=list(window.queue_playlist_entries),
+        queue_entry_tokens=list(getattr(window, "_queue_entry_tokens", [])),
         selected_rows=selected_rows,
         scroll_position=scrollbar.value() if scrollbar is not None else None,
         current_path=window.current_path,

@@ -222,9 +222,16 @@ class VideoTransitionManager(QtCore.QObject):
         overlay: Optional[VideoTransitionOverlay] = None,
         rng: Optional[random.Random] = None,
         dual_engine: Optional[DualVideoTransitionEngine] = None,
+        automatic_progress_suspended: Optional[Callable[[], bool]] = None,
     ):
         super().__init__(parent)
         self.controller = VideoTransitionController(rng)
+        # Astra F2: the player's intentional-Pause authority. While it holds,
+        # no automatic transition starts, a running automatic outgoing
+        # animation is frozen, and its switch point (the queue advance) is
+        # held for Resume. Manual transitions are explicit and not gated.
+        self._automatic_progress_suspended = automatic_progress_suspended
+        self._switch_point_held = False
         self.preferences = VideoTransitionPreferences()
         self._host_provider = host_provider
         self._advance_callback = advance_callback
@@ -276,6 +283,15 @@ class VideoTransitionManager(QtCore.QObject):
     def configure_dual(self, preferences) -> None:
         if self._dual_engine is not None:
             self._dual_engine.configure(preferences)
+
+    def _automatic_progress_is_suspended(self) -> bool:
+        provider = self._automatic_progress_suspended
+        if provider is None:
+            return False
+        try:
+            return bool(provider())
+        except Exception:
+            return False
 
     def media_changed(self) -> None:
         self.controller.reset_for_media()
@@ -344,6 +360,8 @@ class VideoTransitionManager(QtCore.QObject):
                 # request_manual_next() (v1.0.51) -- this was the one call
                 # site that fix didn't cover.
                 return
+        if self._automatic_progress_is_suspended():
+            return  # Astra F2: re-evaluated from the next position after Resume
         if (
             self.preferences.enabled
             and self.controller.supports(current_media_type, self._target_hint())
@@ -461,9 +479,23 @@ class VideoTransitionManager(QtCore.QObject):
         return True
 
     def playback_paused(self, paused: bool) -> None:
-        """Forwarded from window.py's pause()/resume() handling. A no-op
-        unless a genuine dual cross-dissolve is actively committed -- Phase
-        1's overlay has no playing timeline of its own to pause."""
+        """Forwarded from window.py's pause()/resume() handling, after the
+        player's Pause authority has changed. An automatic outgoing overlay
+        freezes with playback (Astra F2) -- QAbstractAnimation excludes the
+        paused time -- and a switch point it reached while paused runs on
+        Resume. The dual engine handles its own pause below."""
+        if (
+            self.controller.state == TransitionState.OUTGOING
+            and self.controller.trigger == "automatic"
+        ):
+            method = "pause_animation" if paused else "resume_animation"
+            try:
+                getattr(self._overlay, method, lambda: None)()
+            except Exception:
+                pass
+            if not paused and self._switch_point_held:
+                self._switch_point_held = False
+                self._reach_switch_point()
         if self._dual_engine is not None:
             self._dual_engine.playback_paused(paused)
 
@@ -528,6 +560,7 @@ class VideoTransitionManager(QtCore.QObject):
             self._dual_engine.playback_stopped(reason)
 
     def cancel(self, reason: str, *, allow_automatic_retry: bool = False) -> bool:
+        self._switch_point_held = False
         # Cancelling a pending dual preload is always safe to attempt
         # alongside the overlay cancel below -- DualVideoTransitionEngine
         # refuses on its own once a dual transition has actually committed
@@ -619,6 +652,17 @@ class VideoTransitionManager(QtCore.QObject):
             self._visual_failure(ex, switch_needed=True)
 
     def _reach_switch_point(self) -> None:
+        if (
+            not self._closing
+            and self.controller.state == TransitionState.OUTGOING
+            and self.controller.trigger == "automatic"
+            and self._automatic_progress_is_suspended()
+        ):
+            # Astra F2: the automatic advance waits, covered, for Resume
+            # (playback_paused(False)); cancel() drops it.
+            self._switch_point_held = True
+            self._record("switch_point_held_while_paused", {})
+            return
         if self._closing or not self.controller.mark_switching():
             return
         self._record("switch_point_reached", {"trigger": self.controller.trigger or ""})
